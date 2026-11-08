@@ -160,15 +160,34 @@ class PortfolioImportService:
                 skipped += 1
                 continue
             try:
-                # Keep a stable line-level marker so repeated imports of the same
-                # file remain idempotent, while identical split fills on separate
-                # CSV lines do not collapse into one dedup key.
+                # Line number stays for diagnostics only; dedup identity uses
+                # content + a per-content occurrence ordinal assigned below.
                 normalized["_source_line_number"] = int(idx) + 2
-                normalized["dedup_hash"] = self._build_dedup_hash(normalized)
                 records.append(normalized)
             except Exception as exc:  # pragma: no cover - defensive path
                 skipped += 1
                 errors.append(f"row={idx + 1}: {exc}")
+
+        # Assign occurrence ordinals per identical content so re-imports are
+        # idempotent while legitimate identical duplicate fills stay distinct.
+        occurrence_counts: Dict[str, int] = {}
+        for record in records:
+            content_key = "|".join(
+                [
+                    str(record.get("trade_date") or ""),
+                    str(record.get("symbol") or ""),
+                    str(record.get("side") or ""),
+                    f"{float(record.get('quantity', 0.0)):.8f}",
+                    f"{float(record.get('price', 0.0)):.8f}",
+                    f"{float(record.get('fee', 0.0)):.8f}",
+                    f"{float(record.get('tax', 0.0)):.8f}",
+                    str(record.get("currency") or ""),
+                ]
+            )
+            seen = occurrence_counts.get(content_key, 0) + 1
+            occurrence_counts[content_key] = seen
+            record["_content_occurrence"] = seen
+            record["dedup_hash"] = self._build_dedup_hash(record)
 
         return {
             "broker": broker_norm,
@@ -432,6 +451,13 @@ class PortfolioImportService:
 
     @staticmethod
     def _build_dedup_hash(record: Dict[str, Any]) -> str:
+        # Business identity for CSV import dedup (T05/D12):
+        # - Content fields only — the source line number is NOT part of the
+        #   identity, so a re-imported file with reordered rows stays
+        #   idempotent instead of double-counting.
+        # - Legitimate identical fills (same content on separate rows) are
+        #   distinguished by a per-content occurrence ordinal assigned across
+        #   the whole file, so two real identical trades do not collapse.
         payload = "|".join(
             [
                 str(record.get("trade_date") or ""),
@@ -442,7 +468,7 @@ class PortfolioImportService:
                 f"{float(record.get('fee', 0.0)):.8f}",
                 f"{float(record.get('tax', 0.0)):.8f}",
                 str(record.get("currency") or ""),
-                str(record.get("_source_line_number") or record.get("source_line_number") or ""),
+                f"occ={int(record.get('_content_occurrence') or 1)}",
             ]
         )
         return hashlib.sha256(payload.encode("utf-8")).hexdigest()

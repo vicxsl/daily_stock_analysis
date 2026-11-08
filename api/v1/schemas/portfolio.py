@@ -55,6 +55,76 @@ class PortfolioTradeCreateRequest(BaseModel):
     currency: Optional[str] = Field(None, min_length=3, max_length=8)
     trade_uid: Optional[str] = Field(None, max_length=128)
     note: Optional[str] = Field(None, max_length=255)
+    event_type: Literal["trade", "baseline", "init"] = "trade"
+
+
+class PortfolioBaselinePosition(BaseModel):
+    symbol: str = Field(..., min_length=1, max_length=16)
+    quantity: float = Field(..., gt=0)
+    # None/0 = cost unknown at confirmation time: the position is kept but its
+    # unrealized PnL / pct are not computed (R2).
+    cost_per_unit: Optional[float] = Field(None, ge=0)
+    # Optional confirmed instrument type — recorded into the identity registry
+    # used for valuation routing (R3/F06).
+    asset_kind: Optional[Literal["stock", "etf", "index", "otc_fund"]] = None
+    market: Optional[Literal["cn", "hk", "us", "jp", "kr", "tw"]] = None
+    currency: Optional[str] = Field(None, min_length=3, max_length=8)
+
+
+class PortfolioBaselineCreateRequest(BaseModel):
+    account_id: int
+    baseline_date: date
+    # Empty positions = confirmed empty account; the service then requires cash
+    # to be declared, otherwise there is nothing to anchor the baseline.
+    positions: List[PortfolioBaselinePosition] = Field(default_factory=list)
+    cash: Optional[float] = Field(None, ge=0)
+    cash_currency: Optional[str] = Field(None, min_length=3, max_length=8)
+    note: Optional[str] = Field(None, max_length=255)
+
+
+class PortfolioBaselinePositionResult(BaseModel):
+    symbol: str
+    id: int
+    duplicate: bool
+
+
+class PortfolioBaselineCashResult(BaseModel):
+    amount: float
+    currency: str
+    duplicate: bool
+
+
+class PortfolioBaselineResponse(BaseModel):
+    account_id: int
+    baseline_date: str
+    positions: List[PortfolioBaselinePositionResult] = Field(default_factory=list)
+    cash: Optional[PortfolioBaselineCashResult] = None
+    duplicate: bool = False
+
+
+class PortfolioInstrumentIdentityRequest(BaseModel):
+    symbol: str = Field(..., min_length=1, max_length=16)
+    kind: Literal["stock", "etf", "index", "otc_fund"]
+    market: str = "cn"
+    currency: str = "CNY"
+    confirmed_by: Optional[str] = Field(None, max_length=64)
+    note: Optional[str] = Field(None, max_length=255)
+
+
+class PortfolioInstrumentIdentityItem(BaseModel):
+    symbol: str
+    kind: str
+    market: str
+    currency: str
+    source: Optional[str] = None
+    confirmed_by: Optional[str] = None
+    confirmed_at: Optional[str] = None
+    note: Optional[str] = None
+
+
+class PortfolioInstrumentIdentityResponse(BaseModel):
+    ok: bool = True
+    identity: PortfolioInstrumentIdentityItem
 
 
 class PortfolioCashLedgerCreateRequest(BaseModel):
@@ -95,6 +165,7 @@ class PortfolioTradeListItem(BaseModel):
     currency: str
     trade_date: str
     side: str
+    event_type: str = "trade"
     quantity: float
     price: float
     fee: float
@@ -166,8 +237,24 @@ class PortfolioPositionItem(BaseModel):
     price_date: Optional[str] = None
     price_stale: bool = False
     price_available: bool = True
+    price_kind: str = "close"
+    price_provider_time: Optional[str] = None
+    price_fetched_at: Optional[str] = None
+    price_time_quality: str = "valid"
+    # R4/F09: shared-upstream disclosure — akshare ETF / efinance ETF / fund
+    # NAV all ride eastmoney public endpoints and are NOT independent sources.
+    price_upstream_group: Optional[str] = None
+    # True = quantity kept but the confirmed cost is unknown: unrealized PnL is
+    # reported as not-computed, never as market value or fake zero-PnL (R2).
+    cost_basis_unknown: bool = False
     data_quality: str = "ok"
     limitations: List[str] = Field(default_factory=list)
+
+
+class PortfolioValuationCoverage(BaseModel):
+    valued: int
+    total: int
+    unvalued_symbols: List[str] = Field(default_factory=list)
 
 
 class PortfolioPositionAnalysisRequest(BaseModel):
@@ -185,20 +272,39 @@ class PortfolioAccountSnapshot(BaseModel):
     base_currency: str
     as_of: str
     cost_method: str
-    total_cash: float
+    # None = cash unknown at the active baseline (never substituted with 0);
+    # total_equity is then not computed either (R2/F02).
+    total_cash: Optional[float] = None
     total_market_value: float
     total_market_value_aggregate: Optional[float] = Field(
         None, description="Account market value converted into the parent snapshot currency"
     )
-    total_equity: float
+    total_equity: Optional[float] = None
     realized_pnl: float
     unrealized_pnl: float
     fee_total: float
     tax_total: float
     fx_stale: bool
+    cash_known: bool = True
     data_quality: str = "ok"
     limitations: List[str] = Field(default_factory=list)
     positions: List[PortfolioPositionItem] = Field(default_factory=list)
+    valuation_coverage: Optional[PortfolioValuationCoverage] = None
+    baseline_date: Optional[str] = None
+    event_type_counts: Dict[str, int] = Field(default_factory=dict)
+    superseded_event_count: Optional[int] = None
+
+
+class PortfolioQuoteRef(BaseModel):
+    account_id: int
+    symbol: str
+    price: Optional[float] = None
+    provider: Optional[str] = None
+    price_kind: Optional[str] = None
+    provider_time: Optional[str] = None
+    price_date: Optional[str] = None
+    time_quality: Optional[str] = None
+    price_stale: bool = False
 
 
 class PortfolioSnapshotResponse(BaseModel):
@@ -206,14 +312,19 @@ class PortfolioSnapshotResponse(BaseModel):
     cost_method: str
     currency: str
     account_count: int
-    total_cash: float
+    # R3: one identity for the quotes this response was built from; positions,
+    # totals and consumers (reports/alerts) reference the same valuation.
+    valuation_id: Optional[str] = None
+    quote_refs: List[PortfolioQuoteRef] = Field(default_factory=list)
+    total_cash: Optional[float] = None
     total_market_value: float
-    total_equity: float
+    total_equity: Optional[float] = None
     realized_pnl: float
     unrealized_pnl: float
     fee_total: float
     tax_total: float
     fx_stale: bool
+    cash_known: bool = True
     data_quality: str = "ok"
     limitations: List[str] = Field(default_factory=list)
     accounts: List[PortfolioAccountSnapshot] = Field(default_factory=list)
@@ -287,6 +398,10 @@ class PortfolioDecisionSignalRiskBlock(BaseModel):
 
 
 class PortfolioRiskResponse(BaseModel):
+    valuation_id: Optional[str] = None
+    quote_refs: List[Dict[str, Any]] = Field(default_factory=list)
+    data_quality: str = "unknown"
+    limitations: List[str] = Field(default_factory=list)
     as_of: str
     account_id: Optional[int] = None
     cost_method: str

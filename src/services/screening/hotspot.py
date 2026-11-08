@@ -8,6 +8,7 @@ from __future__ import annotations
 import json
 import math
 import os
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -380,15 +381,28 @@ def discover_hotspots(
         ))
 
     ranked = sorted(summaries, key=_hotspot_sort_key, reverse=True)[:max(int(top), 0)]
-    for summary in ranked:
-        provider_obj = next((obj for label, obj in provider_chain if label == provider_used), None)
+    provider_obj = next((obj for label, obj in provider_chain if label == provider_used), None)
+
+    def load_stocks(summary: HotspotSummary) -> tuple[list[HotspotStock], list[str]]:
+        errors: list[str] = []
         stocks = _load_scored_constituents(
             provider_obj,
             summary.topic,
             source=summary.source,
-            source_errors=source_errors,
+            source_errors=errors,
             provider_label=provider_used,
         ) if provider_obj is not None else []
+        return stocks, errors
+
+    if len(ranked) > 1 and getattr(provider_obj, "_screening_parallel_boards", False):
+        with ThreadPoolExecutor(max_workers=2, thread_name_prefix="screening-boards") as executor:
+            loaded = list(executor.map(load_stocks, ranked))
+    else:
+        loaded = [load_stocks(summary) for summary in ranked]
+    for summary, (stocks, errors) in zip(ranked, loaded):
+        source_errors.extend(errors)
+        if stocks and any(error.startswith("eastmoney constituents ") for error in errors):
+            summary.fallback_used = True
         summary.sample_stock_count = len(stocks)
         _set_summary_leaders(summary, stocks)
         if not stocks:
@@ -407,7 +421,7 @@ def discover_hotspots(
     return _with_result_metadata(
         ranked,
         provider_used=provider_used,
-        fallback_used=False,
+        fallback_used=any(summary.fallback_used for summary in ranked),
         source_errors=source_errors,
         stale=False,
         stale_age_hours=None,
@@ -1664,7 +1678,11 @@ def _call_provider_frame(
     except Exception as exc:  # noqa: BLE001 - provider runtime instability is degraded.
         _record_provider_error(source_errors, provider_label, method_name, exc)
         return None
-    return frame if isinstance(frame, pd.DataFrame) else None
+    if isinstance(frame, pd.DataFrame):
+        if source_errors is not None:
+            source_errors.extend(frame.attrs.get("source_errors", []))
+        return frame
+    return None
 
 
 def _mapping_provider_frame(provider: object, key: str) -> pd.DataFrame | None:

@@ -69,6 +69,106 @@ DEFAULT_INTRADAY_TTL_HOURS = {
 
 logger = logging.getLogger(__name__)
 
+# T1（2026-11-07）：入场区间数量级/一致性异常检测。
+# 背景：decision_signals id287（513010）现价 0.526、secondary_buy=3.0 被保存为
+# entry_high 且 plan_quality=complete——模型输出层数量级异常（单位混写/字段错位），
+# 既有 _validate_entry_range 只检查 entry_low<=entry_high，无法拦截。
+# 义务（11-07 复评 P0 + C4）：异常字段隔离至来源核对，原始值保留展示、不猜测
+# 修正值；携带异常的计划质量至多 partial，永不 complete。阈值与 OpenClaw 侧
+# lib/pretrade.mjs validateEntryPlan 保持一致（现价 3 倍/三分之一 + 四值聚簇游离），
+# 两侧同口径便于对账。
+ENTRY_RANGE_MAGNITUDE_RATIO = 3.0
+
+
+def _evidence_current_price(evidence: Any) -> Optional[float]:
+    """Extract the same-report current price from the signal evidence mapping."""
+
+    if not isinstance(evidence, dict):
+        return None
+    raw = evidence.get("current_price")
+    if raw is None:
+        return None
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        return None
+    return value if math.isfinite(value) and value > 0 else None
+
+
+def _entry_range_anomalies(
+    *,
+    entry_low: Optional[float],
+    entry_high: Optional[float],
+    stop_loss: Optional[float],
+    target_price: Optional[float],
+    current_price: Optional[float],
+) -> List[Dict[str, Any]]:
+    """Detect order/magnitude/cluster anomalies among entry-plan price fields.
+
+    Returns anomaly records (code/field/value + context); empty list means no
+    anomaly was detectable with the given inputs. Values are reported, never
+    corrected — quarantined fields stay visible in the stored record.
+    """
+
+    values = {
+        "entry_low": entry_low,
+        "entry_high": entry_high,
+        "stop_loss": stop_loss,
+        "target_price": target_price,
+    }
+    anomalies: List[Dict[str, Any]] = []
+    finite = {
+        key: float(value)
+        for key, value in values.items()
+        if value is not None
+        and isinstance(value, (int, float))
+        and math.isfinite(float(value))
+    }
+
+    range_bottom = finite.get("entry_low", finite.get("entry_high"))
+    range_top = finite.get("entry_high", finite.get("entry_low"))
+    if range_bottom is not None and finite.get("stop_loss") is not None and finite["stop_loss"] >= range_bottom:
+        anomalies.append({
+            "code": "stop_not_below_range",
+            "field": "stop_loss",
+            "value": finite["stop_loss"],
+            "range_bottom": range_bottom,
+        })
+    if range_top is not None and finite.get("target_price") is not None and finite["target_price"] <= range_top:
+        anomalies.append({
+            "code": "target_not_above_range",
+            "field": "target_price",
+            "value": finite["target_price"],
+            "range_top": range_top,
+        })
+    if current_price is not None and math.isfinite(current_price) and current_price > 0:
+        for key in ("entry_low", "entry_high", "stop_loss", "target_price"):
+            value = finite.get(key)
+            if value is None:
+                continue
+            if value > current_price * ENTRY_RANGE_MAGNITUDE_RATIO or value < current_price / ENTRY_RANGE_MAGNITUDE_RATIO:
+                anomalies.append({
+                    "code": "entry_range_magnitude_anomaly",
+                    "field": key,
+                    "value": value,
+                    "current_price": current_price,
+                })
+    if len(finite) == 4:
+        ordered = sorted(finite.values())
+        median = (ordered[1] + ordered[2]) / 2.0
+        stray = [
+            key for key, value in finite.items()
+            if value > median * ENTRY_RANGE_MAGNITUDE_RATIO or value < median / ENTRY_RANGE_MAGNITUDE_RATIO
+        ]
+        if len(stray) == 1:
+            anomalies.append({
+                "code": "signal_field_inconsistent",
+                "field": stray[0],
+                "value": finite[stray[0]],
+                "cluster_median": median,
+            })
+    return anomalies
+
 
 class DecisionSignalNotFoundError(ValueError):
     """Raised when a requested decision signal does not exist."""
@@ -869,6 +969,18 @@ class DecisionSignalService:
         if fields["status"] == "active" and self._is_expired(fields["expires_at"]):
             fields["status"] = "expired"
         self._validate_entry_range(fields)
+        # T1（2026-11-07）：异常检测在字段规范化后执行；发现异常→写入 metadata 并
+        # 重序列化（fields 构造在先）；原始价格字段不修改（隔离≠篡改）。
+        entry_anomalies = _entry_range_anomalies(
+            entry_low=fields.get("entry_low"),
+            entry_high=fields.get("entry_high"),
+            stop_loss=fields.get("stop_loss"),
+            target_price=fields.get("target_price"),
+            current_price=_evidence_current_price(payload.get("evidence")),
+        )
+        if entry_anomalies:
+            metadata["entry_range_anomaly"] = entry_anomalies
+            fields["metadata_json"] = self._json_dumps(metadata)
         fields["plan_quality"] = self._normalize_plan_quality(
             payload.get("plan_quality"),
             fields=fields,
@@ -1058,7 +1170,10 @@ class DecisionSignalService:
 
     def _normalize_plan_quality(self, value: Any, *, fields: Dict[str, Any]) -> str:
         if value is not None:
-            return self._normalize_enum(value, PLAN_QUALITIES, "plan_quality")
+            normalized = self._normalize_enum(value, PLAN_QUALITIES, "plan_quality")
+            if normalized == "complete" and self._plan_has_entry_range_anomaly(fields):
+                return "partial"
+            return normalized
         has_action_or_reason = bool(fields.get("action") or fields.get("reason"))
         if not has_action_or_reason:
             return "unknown"
@@ -1068,11 +1183,27 @@ class DecisionSignalService:
         for key in ("stop_loss", "target_price", "invalidation", "watch_conditions"):
             if fields.get(key) not in (None, ""):
                 slots += 1
+        if self._plan_has_entry_range_anomaly(fields):
+            # 数量级/一致性异常已隔离至来源核对：质量至多 partial，永不 complete。
+            return "partial" if slots >= 2 else "minimal"
         if slots >= 4:
             return "complete"
         if slots >= 2:
             return "partial"
         return "minimal"
+
+    @staticmethod
+    def _plan_has_entry_range_anomaly(fields: Dict[str, Any]) -> bool:
+        """True when the stored metadata records quarantined entry-range anomalies."""
+
+        raw = fields.get("metadata_json")
+        if not raw:
+            return False
+        try:
+            parsed = json.loads(raw)
+        except (TypeError, ValueError):
+            return False
+        return bool(isinstance(parsed, dict) and parsed.get("entry_range_anomaly"))
 
     def _cached_holding_identities(self, *, account_id: Optional[int]) -> set[Tuple[str, str]]:
         identities = self.portfolio_repo.list_cached_position_identities(account_id=account_id)

@@ -273,6 +273,29 @@ def test_decision_signal_static_api_spec_matches_runtime_paths() -> None:
     assert status_schema["enum"] == ["active", "expired", "invalidated", "closed", "archived"]
 
 
+def test_personal_portfolio_api_spec_matches_runtime_contract() -> None:
+    static_spec = json.loads(
+        (Path(__file__).resolve().parents[1] / "docs/architecture/api_spec.json").read_text(encoding="utf-8")
+    )
+    runtime_spec = create_app().openapi()
+    for path in (
+        "/api/v1/portfolio/baseline",
+        "/api/v1/portfolio/instrument-identities",
+        "/api/v1/portfolio/instrument-identity",
+        "/api/v1/portfolio/trades",
+    ):
+        assert static_spec["paths"][path] == runtime_spec["paths"][path]
+    for name in (
+        "PortfolioTradeCreateRequest", "PortfolioTradeListItem", "PortfolioTradeListResponse",
+        "PortfolioBaselinePosition", "PortfolioBaselineCreateRequest", "PortfolioBaselinePositionResult",
+        "PortfolioBaselineCashResult", "PortfolioBaselineResponse", "PortfolioInstrumentIdentityRequest",
+        "PortfolioInstrumentIdentityItem", "PortfolioInstrumentIdentityResponse", "PortfolioPositionItem",
+        "PortfolioValuationCoverage", "PortfolioAccountSnapshot", "PortfolioQuoteRef",
+        "PortfolioSnapshotResponse", "PortfolioRiskResponse",
+    ):
+        assert static_spec["components"]["schemas"][name] == runtime_spec["components"]["schemas"][name]
+
+
 def test_v1_prefix_is_applied_at_app_mount_level() -> None:
     assert api_v1_router.prefix == ""
 

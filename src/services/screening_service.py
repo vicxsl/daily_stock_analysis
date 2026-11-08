@@ -2018,6 +2018,12 @@ def _resolve_hotspot_provider(provider: str) -> Tuple[str, Any]:
     return "akshare", DsaEastMoneyHotspotProvider()
 
 
+class _ConstituentFrames(list):
+    def __init__(self, frames: List[Any], source_errors: List[str]) -> None:
+        super().__init__(frames)
+        self.source_errors = source_errors
+
+
 class DsaEastMoneyHotspotProvider:
     """Minimal EastMoney board provider for Screening hotspot scoring."""
 
@@ -2026,6 +2032,7 @@ class DsaEastMoneyHotspotProvider:
     _AKSHARE_CALL_TIMEOUT_SECONDS = 4.0
     _CONSTITUENT_HTTP_TIMEOUT = (1.0, 2.0)
     _CONSTITUENT_WORKER_SLOTS = threading.BoundedSemaphore(4)
+    _screening_parallel_boards = True
     _COMMON_PARAMS = {
         "pn": "1",
         "po": "1",
@@ -2352,6 +2359,7 @@ class DsaEastMoneyHotspotProvider:
                 self._CONSTITUENT_WORKER_SLOTS.release()
 
         frames_by_source: Dict[str, Any] = {}
+        source_errors: List[str] = []
         with ThreadPoolExecutor(
             max_workers=len(fetchers),
             thread_name_prefix="screening-constituents",
@@ -2359,6 +2367,7 @@ class DsaEastMoneyHotspotProvider:
             futures = {}
             for label, fetch in fetchers:
                 if not self._CONSTITUENT_WORKER_SLOTS.acquire(blocking=False):
+                    source_errors.append(f"{label} constituents {topic}: worker capacity exhausted")
                     logger.info(
                         "Screening %s constituent source skipped for %s: worker capacity exhausted",
                         label,
@@ -2376,15 +2385,17 @@ class DsaEastMoneyHotspotProvider:
                     payload = future.result()
                 except BaseException as exc:  # noqa: BLE001 - external source failures are isolated.
                     logger.info("Screening %s constituent source failed for %s: %s", label, topic, exc)
+                    source_errors.append(f"{label} constituents {topic}: {type(exc).__name__}")
                     continue
                 if payload is None or bool(getattr(payload, "empty", False)):
                     continue
                 frames_by_source[label] = payload
-        return [
+        frames = [
             frames_by_source[label]
             for label, _fetch in fetchers
             if label in frames_by_source
         ]
+        return _ConstituentFrames(frames, source_errors)
 
     def hotspot_detail(self, topic: str) -> Dict[str, Any]:
         with self._source_call_budget():
@@ -2401,9 +2412,11 @@ class DsaEastMoneyHotspotProvider:
             )
             summary = {}
         if self._is_industry_hotspot(topic):
-            stocks = self._normalize_constituent_records(self.stock_board_industry_cons_em(topic))
+            constituent_frame = self.stock_board_industry_cons_em(topic)
         else:
-            stocks = self._normalize_constituent_records(self.stock_board_concept_cons_em(topic))
+            constituent_frame = self.stock_board_concept_cons_em(topic)
+        stocks = self._normalize_constituent_records(constituent_frame)
+        source_errors = list(getattr(constituent_frame, "attrs", {}).get("source_errors", []))
         route = self._build_hotspot_route(topic, summary)
         info = self._fetch_ths_info(topic)
         if info:
@@ -2432,7 +2445,8 @@ class DsaEastMoneyHotspotProvider:
             "stocks": stocks[:30],
             "leader_stocks": stocks[:30],
             "stock_count": len(stocks),
-            "source_errors": [],
+            "source_errors": source_errors,
+            "fallback_used": bool(stocks and any(item.startswith("eastmoney constituents ") for item in source_errors)),
         })
 
     def _fetch_board_changes(self) -> Any:
@@ -2934,21 +2948,23 @@ class DsaEastMoneyHotspotProvider:
         frame = self._constituent_cache.get((source, _env_text(topic)))
         if frame is None:
             return None
-        return pd.DataFrame(frame).copy()
+        return frame.copy() if isinstance(frame, pd.DataFrame) else pd.DataFrame(frame).copy()
 
     def _set_constituent_cache(self, source: str, topic: str, frame: Any) -> None:
         import pandas as pd
 
         if not hasattr(self, "_constituent_cache"):
             self._constituent_cache = {}
-        self._constituent_cache[(source, _env_text(topic))] = pd.DataFrame(frame).copy()
+        self._constituent_cache[(source, _env_text(topic))] = frame.copy() if isinstance(frame, pd.DataFrame) else pd.DataFrame(frame).copy()
 
     def _merge_constituent_frames(self, frames: List[Any]) -> Any:
         import pandas as pd
 
         merged: List[Dict[str, Any]] = []
+        source_errors: List[str] = list(getattr(frames, "source_errors", []))
         seen: set[str] = set()
         for frame in frames:
+            source_errors.extend(getattr(frame, "attrs", {}).get("source_errors", []))
             df = pd.DataFrame(frame)
             if df.empty:
                 continue
@@ -2965,7 +2981,9 @@ class DsaEastMoneyHotspotProvider:
                 record.setdefault("code", code)
                 record.setdefault("name", name)
                 merged.append(record)
-        return pd.DataFrame(merged)
+        result = pd.DataFrame(merged)
+        result.attrs["source_errors"] = source_errors
+        return result
 
     def _normalize_constituent_records(self, frame: Any) -> List[Dict[str, Any]]:
         import pandas as pd

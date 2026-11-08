@@ -628,6 +628,7 @@ class MainPortfolioTest(unittest.TestCase):
             eval_window_days=10,
             min_age_days=14,
             limit=200,
+            retry_incomplete=True,
         )
 
     def test_empty_futu_portfolio_uses_an_accurate_skip_reason(self):

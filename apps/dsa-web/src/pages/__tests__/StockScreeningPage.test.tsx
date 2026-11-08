@@ -335,6 +335,20 @@ describe('StockScreeningPage', () => {
     });
   });
 
+  it('shows a warning when hotspot results include source failures', async () => {
+    getScreeningStatus.mockResolvedValueOnce({ enabled: true, available: true });
+    getHotspots.mockResolvedValueOnce({
+      enabled: true, provider: 'akshare', providerUsed: 'akshare',
+      hotspots: [{ topic: 'AI算力', name: 'AI算力', heatScore: 88 }],
+      hotspotCount: 1, sourceErrors: ['eastmoney constituents AI算力: TimeoutError'],
+    });
+    render(<StockScreeningPage />);
+    await screen.findByText('选股已开启');
+    fireEvent.click(screen.getByRole('button', { name: /展开热点题材/ }));
+    expect(await screen.findByText('部分热点数据源暂不可用，结果可能不完整。')).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: /AI算力/ })).toBeInTheDocument();
+  });
+
   it('searches recent hotspot news only when requested and links the result', async () => {
     getScreeningStatus.mockResolvedValueOnce({ enabled: true, available: true });
     getHotspots.mockResolvedValueOnce({

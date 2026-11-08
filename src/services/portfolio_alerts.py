@@ -248,6 +248,12 @@ def evaluate_portfolio_risk_alert(
         return _evaluate_price_stale(rule, snapshot)
 
     report = risk.get_risk_report(account_id=account_id, cost_method="fifo")
+    # 10-24：同一估值的时间未知/陈旧报价不能触发价格型组合警报。
+    unverified = [q for q in report.get("quote_refs", []) if q.get("time_quality") == "unknown" or q.get("price_stale")]
+    if unverified:
+        return _portfolio_result(rule, triggered=False, observed_value=None, threshold=None,
+            message="Price freshness unverified; current-price portfolio alert paused",
+            record_status="degraded", diagnostics={"error":"price_time_unverified","symbols":[q.get("symbol") for q in unverified]})
     if rule.alert_type == "portfolio_stop_loss":
         return _evaluate_stop_loss(rule, report)
     if rule.alert_type == "portfolio_concentration":
@@ -485,7 +491,7 @@ def _evaluate_price_stale(rule: PortfolioRiskAlert, snapshot: Dict[str, Any]) ->
     affected: List[Dict[str, Any]] = []
     for account in snapshot.get("accounts", []) or []:
         for position in account.get("positions", []) or []:
-            if bool(position.get("price_stale")) or not bool(position.get("price_available", True)):
+            if bool(position.get("price_stale")) or position.get("price_time_quality") == "unknown" or not bool(position.get("price_available", True)):
                 affected.append({
                     "account_id": account.get("account_id"),
                     "symbol": position.get("symbol"),

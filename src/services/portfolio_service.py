@@ -4,21 +4,25 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import logging
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from dataclasses import dataclass
-from datetime import date, timedelta
+from dataclasses import dataclass, field
+from datetime import date, datetime, timedelta, timezone
 from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
 
 from data_provider.base import canonical_stock_code, normalize_stock_code
+from data_provider.realtime_types import upstream_group_for
 from src.config import get_config
+from src.core.trading_calendar import is_market_open
 from src.repositories.portfolio_repo import (
     DuplicateTradeDedupHashError,
     DuplicateTradeUidError,
     PortfolioBusyError as RepoPortfolioBusyError,
     PortfolioRepository,
 )
+from src.services.fund_nav import classify_cn_symbol, fetch_latest_nav
 
 logger = logging.getLogger(__name__)
 
@@ -34,10 +38,80 @@ VALID_MARKETS = {"cn", "hk", "us", "jp", "kr", "tw"}
 PARTIAL_VALUATION_MARKETS = {"jp", "kr", "tw"}
 VALID_COST_METHODS = {"fifo", "avg"}
 VALID_SIDES = {"buy", "sell"}
+# Event provenance on PortfolioTrade: real trades move cash; baseline/init
+# events establish positions without cash movement and are excluded from
+# real-trade statistics (D12).
+VALID_EVENT_TYPES = {"trade", "baseline", "init"}
+BASELINE_LIKE_EVENT_TYPES = {"baseline", "init"}
 VALID_CASH_DIRECTIONS = {"in", "out"}
 VALID_CORPORATE_ACTIONS = {"cash_dividend", "split_adjustment"}
 PORTFOLIO_FX_REFRESH_DISABLED_REASON = "portfolio_fx_update_disabled"
 PORTFOLIO_REALTIME_QUOTE_MAX_WORKERS = 4
+
+# Intraday realtime quotes older than this are flagged stale while the CN
+# session is live. Quotes dated on a previous trading day while today's CN
+# session has already opened are always stale. Off-session latest closes are
+# NOT stale (they are the most recent official price) — their price_date is
+# exposed honestly instead (T02).
+REALTIME_STALENESS_MAX_AGE_SECONDS = 60 * 60
+# OTC fund NAV publishes with a normal T-1 (or longer for QDII) delay; only
+# flag NAV stale when the latest published NAV date lags the as-of date by
+# more than this many calendar days.
+NAV_STALENESS_MAX_LAG_DAYS = 7
+
+_CN_TZ = timezone(timedelta(hours=8))
+
+
+def _strip_symbol_suffix(symbol: str) -> str:
+    """Normalize a CN symbol to its bare 6-digit code for fund lookups."""
+    raw = (symbol or "").strip().upper()
+    for suffix in (".SH", ".SZ", ".SS", ".BJ", ".OF"):
+        if raw.endswith(suffix):
+            return raw[: -len(suffix)]
+    if len(raw) == 8 and raw[:2] in {"SH", "SZ", "BJ"} and raw[2:].isdigit():
+        return raw[2:]
+    return raw
+
+
+def _fetch_stock_realtime_quote(symbol: str, fetched_at: str) -> Optional[Dict[str, Any]]:
+    """Fetch one realtime quote through the stock DataFetcherManager; None when unusable."""
+    try:
+        from data_provider.base import DataFetcherManager
+
+        fetcher_manager = DataFetcherManager()
+        quote = fetcher_manager.get_realtime_quote(symbol, log_final_failure=False)
+    except Exception as exc:
+        logger.warning("Failed to fetch realtime portfolio price: %s", exc)
+        return None
+
+    if quote is None:
+        return None
+
+    price = getattr(quote, "price", None)
+    try:
+        numeric_price = float(price)
+    except (TypeError, ValueError):
+        return None
+
+    if numeric_price <= 0:
+        return None
+
+    source = getattr(quote, "source", None)
+    provider = getattr(source, "value", None) or (str(source) if source is not None else None)
+    provider_time = getattr(quote, "provider_timestamp", None)
+    if provider_time is not None and not isinstance(provider_time, str):
+        provider_time = str(provider_time)
+    quote_fetched_at = getattr(quote, "fetched_at", None)
+    if not isinstance(quote_fetched_at, str):
+        quote_fetched_at = fetched_at
+    return {
+        "price": numeric_price,
+        "provider": provider,
+        "upstream_group": upstream_group_for(provider),
+        "kind": "realtime",
+        "provider_time": provider_time,
+        "fetched_at": quote_fetched_at,
+    }
 
 
 def _portfolio_limitations_for_market(market: str) -> List[str]:
@@ -104,6 +178,17 @@ class _ResolvedPositionPrice:
     is_stale: bool
     is_available: bool
     provider: Optional[str] = None
+    # T1 price-time semantics: 'realtime' (intraday quote), 'nav' (fund unit
+    # NAV, price_date == nav date), or 'close' (historical daily close).
+    price_kind: str = "close"
+    # Provider-side quote timestamp (ISO string) or NAV date; None means the
+    # provider did not disclose a time — consumers must not claim real-time.
+    provider_time: Optional[str] = None
+    fetched_at: Optional[str] = None
+    # 'valid' = provider_time present and usable; 'unknown' = provider time
+    # missing (fetch time only); price_date then reflects the fetch date and
+    # downstream reports must mark the valuation as time-unknown.
+    time_quality: str = "valid"
 
 
 class PortfolioService:
@@ -199,10 +284,16 @@ class PortfolioService:
         trade_uid: Optional[str] = None,
         dedup_hash: Optional[str] = None,
         note: Optional[str] = None,
+        event_type: str = "trade",
     ) -> Dict[str, Any]:
         side_norm = (side or "").strip().lower()
         if side_norm not in VALID_SIDES:
             raise ValueError("side must be buy or sell")
+        event_type_norm = (event_type or "trade").strip().lower()
+        if event_type_norm not in VALID_EVENT_TYPES:
+            raise ValueError("event_type must be trade, baseline or init")
+        if event_type_norm in BASELINE_LIKE_EVENT_TYPES and side_norm != "buy":
+            raise ValueError("baseline/init events must use side=buy")
         if quantity <= 0 or price <= 0:
             raise ValueError("quantity and price must be > 0")
         if fee < 0 or tax < 0:
@@ -217,6 +308,11 @@ class PortfolioService:
                 account = self._require_active_account_in_session(session=session, account_id=account_id)
                 market_norm = self._normalize_market(market or account.market)
                 currency_norm = self._normalize_currency(currency or self._default_currency_for_market(market_norm))
+                if event_type_norm == "trade":
+                    # R2: real events cannot share a baseline date (undecidable order).
+                    self._reject_same_day_baseline(
+                        session=session, account_id=account_id, day=trade_date
+                    )
                 self._validate_trade_identity(
                     account_id=account_id,
                     trade_uid=trade_uid_norm,
@@ -248,10 +344,232 @@ class PortfolioService:
                     tax=float(tax),
                     note=(note or "").strip() or None,
                     dedup_hash=dedup_hash_norm,
+                    event_type=event_type_norm,
                 )
                 return {"id": int(row.id)}
         except (DuplicateTradeUidError, DuplicateTradeDedupHashError) as exc:
             raise PortfolioConflictError(str(exc)) from exc
+
+    def record_baseline(
+        self,
+        *,
+        account_id: int,
+        baseline_date: date,
+        positions: List[Dict[str, Any]],
+        cash: Optional[float] = None,
+        cash_currency: Optional[str] = None,
+        note: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Create one confirmed account baseline (D12; R2 semantics 2026-10-09).
+
+        A baseline is the confirmed whole-account position/cash STARTING POINT
+        at baseline_date — not additive buys and not a cash inflow:
+
+        - The active baseline (latest baseline_date <= as_of) REPLACES all
+          earlier history during replay: old init rows, older baselines and
+          pre-baseline cash/corp events are superseded (rows stay in the DB
+          for history queries). A symbol missing from the baseline means "no
+          position at that time"; no sell is fabricated.
+        - positions may be empty (confirmed empty account) — but then cash must
+          be declared, otherwise nothing anchors the baseline.
+        - cost_per_unit None/0 = cost unknown: the position is kept, its PnL is
+          not computed.
+        - cash None = unknown (never substituted with 0); cash 0 = confirmed
+          zero cash; cash > 0 = confirmed amount.
+        - Same-day boundary: a baseline cannot share its date with real events
+          (trades / non-baseline cash / corporate actions) — records are
+          date-granular so ordering would be undecidable. Conflicts raise
+          PortfolioConflictError for one manual verification, never a guess.
+        - Idempotency is whole-baseline: re-submitting the identical baseline
+          (same position set + same cash) returns the existing records;
+          different content for the same date conflicts. Re-confirmation uses
+          a NEW baseline_date.
+        """
+        normalized: List[Dict[str, Any]] = []
+        for item in positions:
+            symbol_raw = str(item.get("symbol") or "").strip()
+            if not symbol_raw:
+                raise ValueError("each baseline position needs symbol")
+            quantity = float(item.get("quantity") or 0.0)
+            if quantity <= 0:
+                raise ValueError("each baseline position needs quantity > 0")
+            cost_raw = item.get("cost_per_unit")
+            cost_unknown = cost_raw is None or float(cost_raw) <= 0
+            unit_cost = 0.0 if cost_unknown else float(cost_raw)
+            normalized.append(
+                {
+                    "symbol": symbol_raw,
+                    "quantity": quantity,
+                    "cost_per_unit": unit_cost,
+                    "cost_unknown": cost_unknown,
+                    "currency": item.get("currency"),
+                    "asset_kind": str(item.get("asset_kind") or "").strip().lower(),
+                }
+            )
+        if not normalized and cash is None:
+            raise ValueError(
+                "empty baseline must declare cash (0 for confirmed zero); "
+                "otherwise there is nothing to confirm"
+            )
+        if cash is not None and float(cash) < 0:
+            raise ValueError("cash must be >= 0 (or None for unknown)")
+
+        results: List[Dict[str, Any]] = []
+        with self.repo.portfolio_write_session() as session:
+            account = self._require_active_account_in_session(session=session, account_id=account_id)
+            market_norm = self._normalize_market(account.market)
+
+            self._reject_same_day_real_events(
+                session=session, account_id=account_id, day=baseline_date
+            )
+
+            existing_same_day: Dict[str, Any] = {}
+            for row in self.repo.list_trades_in_session(
+                session=session, account_id=account_id, as_of=baseline_date
+            ):
+                record_type = (getattr(row, "event_type", None) or "trade").strip().lower()
+                if row.trade_date == baseline_date and record_type == "baseline":
+                    existing_same_day[self._normalize_symbol_for_storage(row.symbol)] = row
+
+            cash_note = f"baseline-cash:{account_id}:{baseline_date.isoformat()}"
+            existing_cash = self.repo.find_cash_ledger_by_note(account_id, cash_note, session=session)
+
+            if existing_same_day or existing_cash is not None:
+                # Whole-baseline idempotency: identical content returns the
+                # original records; anything else conflicts (use a new date).
+                stored = {
+                    symbol: (float(row.quantity), float(row.price or 0.0))
+                    for symbol, row in existing_same_day.items()
+                }
+                submitted: Dict[str, Tuple[float, float]] = {}
+                for item in normalized:
+                    symbol_norm = self._normalize_symbol_for_storage(item["symbol"])
+                    if not symbol_norm:
+                        raise ValueError(f"baseline symbol invalid: {item['symbol']}")
+                    if symbol_norm in submitted:
+                        raise ValueError(f"duplicate baseline symbol: {symbol_norm}")
+                    submitted[symbol_norm] = (item["quantity"], item["cost_per_unit"])
+                stored_cash = float(existing_cash.amount) if existing_cash is not None else None
+                cash_matches = (cash is None and stored_cash is None) or (
+                    cash is not None
+                    and stored_cash is not None
+                    and abs(stored_cash - float(cash)) <= EPS
+                )
+                if stored == submitted and cash_matches:
+                    return {
+                        "account_id": account_id,
+                        "baseline_date": baseline_date.isoformat(),
+                        "positions": [
+                            {"symbol": symbol, "id": int(row.id), "duplicate": True}
+                            for symbol, row in existing_same_day.items()
+                        ],
+                        "cash": (
+                            {"amount": stored_cash, "duplicate": True}
+                            if stored_cash is not None
+                            else None
+                        ),
+                        "duplicate": True,
+                    }
+                raise PortfolioConflictError(
+                    f"account {account_id} already has a baseline on "
+                    f"{baseline_date.isoformat()} with different content; "
+                    "re-confirmation requires a new baseline_date"
+                )
+
+            for item in normalized:
+                symbol_norm = self._normalize_symbol_for_storage(item["symbol"])
+                if not symbol_norm:
+                    raise ValueError(f"baseline symbol invalid: {item['symbol']}")
+                trade_uid = f"baseline:{account_id}:{baseline_date.isoformat()}:{symbol_norm}"
+                row = self.repo.add_trade_in_session(
+                    session=session,
+                    account_id=account_id,
+                    trade_uid=trade_uid,
+                    symbol=symbol_norm,
+                    market=market_norm,
+                    currency=self._normalize_currency(
+                        item.get("currency") or self._default_currency_for_market(market_norm)
+                    ),
+                    trade_date=baseline_date,
+                    side="buy",
+                    quantity=item["quantity"],
+                    price=item["cost_per_unit"],
+                    fee=0.0,
+                    tax=0.0,
+                    note=(note or "confirmed account baseline").strip()[:255],
+                    dedup_hash=None,
+                    event_type="baseline",
+                )
+                results.append({"symbol": symbol_norm, "id": int(row.id), "duplicate": False})
+                # R3: a baseline-declared asset_kind confirms the instrument
+                # identity used for valuation routing (metadata, not a fact row).
+                asset_kind_raw = str(item.get("asset_kind") or "").strip().lower()
+                if asset_kind_raw:
+                    from src.services.instrument_identity import InstrumentIdentityService
+
+                    InstrumentIdentityService().upsert(
+                        symbol=symbol_norm,
+                        kind=asset_kind_raw,
+                        market=market_norm,
+                        source=f"baseline:{baseline_date.isoformat()}",
+                        note="confirmed at account baseline",
+                    )
+
+            cash_result: Optional[Dict[str, Any]] = None
+            if cash is not None and float(cash) >= 0:
+                amount = float(cash)
+                currency = self._normalize_currency(cash_currency or account.base_currency)
+                self.repo.add_cash_ledger_in_session(
+                    session=session,
+                    account_id=account_id,
+                    event_date=baseline_date,
+                    direction="in",
+                    amount=amount,
+                    currency=currency,
+                    note=cash_note,
+                )
+                cash_result = {"amount": amount, "currency": currency, "duplicate": False}
+
+        return {
+            "account_id": account_id,
+            "baseline_date": baseline_date.isoformat(),
+            "positions": results,
+            "cash": cash_result,
+            "duplicate": False,
+        }
+
+    def _reject_same_day_real_events(self, *, session: Any, account_id: int, day: date) -> None:
+        """A baseline date must not carry real events (date-granular ordering is undecidable)."""
+        for row in self.repo.list_trades_in_session(session=session, account_id=account_id, as_of=day):
+            record_type = (getattr(row, "event_type", None) or "trade").strip().lower()
+            if row.trade_date == day and record_type == "trade":
+                raise PortfolioConflictError(
+                    f"account {account_id} has real trade(s) on {day.isoformat()}; "
+                    "a baseline cannot share a date with real events — verify the "
+                    "date or choose another baseline_date"
+                )
+        for row in self.repo.list_cash_ledger_in_session(session=session, account_id=account_id, as_of=day):
+            if row.event_date == day and not str(row.note or "").startswith("baseline-cash:"):
+                raise PortfolioConflictError(
+                    f"account {account_id} has non-baseline cash ledger row(s) on "
+                    f"{day.isoformat()}; confirm the baseline on a day without cash events"
+                )
+        for row in self.repo.list_corporate_actions_in_session(session=session, account_id=account_id, as_of=day):
+            if row.effective_date == day:
+                raise PortfolioConflictError(
+                    f"account {account_id} has corporate action(s) on {day.isoformat()}; "
+                    "a baseline cannot share a date with corporate actions"
+                )
+
+    def _reject_same_day_baseline(self, *, session: Any, account_id: int, day: date) -> None:
+        """Real events cannot land on a date that already carries a baseline."""
+        for row in self.repo.list_trades_in_session(session=session, account_id=account_id, as_of=day):
+            record_type = (getattr(row, "event_type", None) or "trade").strip().lower()
+            if row.trade_date == day and record_type == "baseline":
+                raise PortfolioConflictError(
+                    f"account {account_id} has a confirmed baseline on {day.isoformat()}; "
+                    "real events cannot share the baseline date (ordering undecidable)"
+                )
 
     def record_cash_ledger(
         self,
@@ -270,6 +588,8 @@ class PortfolioService:
             raise ValueError("amount must be > 0")
         with self.repo.portfolio_write_session() as session:
             account = self._require_active_account_in_session(session=session, account_id=account_id)
+            if not (note or "").strip().startswith("baseline-cash:"):
+                self._reject_same_day_baseline(session=session, account_id=account_id, day=event_date)
             currency_norm = self._normalize_currency(currency or account.base_currency)
             row = self.repo.add_cash_ledger_in_session(
                 session=session,
@@ -346,6 +666,7 @@ class PortfolioService:
         date_to: Optional[date] = None,
         symbol: Optional[str] = None,
         side: Optional[str] = None,
+        event_type: Optional[str] = None,
         page: int = 1,
         page_size: int = 20,
     ) -> Dict[str, Any]:
@@ -367,6 +688,12 @@ class PortfolioService:
             if side_norm not in VALID_SIDES:
                 raise ValueError("side must be buy or sell")
 
+        event_type_norm: Optional[str] = None
+        if event_type is not None and event_type.strip():
+            event_type_norm = event_type.strip().lower()
+            if event_type_norm not in VALID_EVENT_TYPES:
+                raise ValueError("event_type must be trade, baseline or init")
+
         rows, total = self.repo.query_trades(
             account_id=account_id,
             date_from=date_from,
@@ -375,6 +702,7 @@ class PortfolioService:
             side=side_norm,
             page=page,
             page_size=page_size,
+            event_type=event_type_norm,
         )
         return {
             "items": [self._trade_row_to_dict(row) for row in rows],
@@ -515,9 +843,9 @@ class PortfolioService:
                     snapshot_date=as_of_date,
                     cost_method=method,
                     base_currency=account.base_currency,
-                    total_cash=account_snapshot["total_cash"],
+                    total_cash=account_snapshot["total_cash"] if account_snapshot["cash_known"] else 0.0,
                     total_market_value=account_snapshot["total_market_value"],
-                    total_equity=account_snapshot["total_equity"],
+                    total_equity=account_snapshot["total_equity"] if account_snapshot["cash_known"] else 0.0,
                     unrealized_pnl=account_snapshot["unrealized_pnl"],
                     realized_pnl=account_snapshot["realized_pnl"],
                     fee_total=account_snapshot["fee_total"],
@@ -535,8 +863,13 @@ class PortfolioService:
                 account_snapshot["public"].get("limitations", []),
             )
 
+            if not account_snapshot["cash_known"]:
+                # One account with unknown cash makes the aggregate cash/equity
+                # incomplete: report unknown instead of summing partials (R2).
+                aggregate["cash_known"] = False
+
             cash_cny, stale_cash, _ = self._convert_amount(
-                amount=account_snapshot["total_cash"],
+                amount=account_snapshot["total_cash"] if account_snapshot["cash_known"] else 0.0,
                 from_currency=account.base_currency,
                 to_currency=aggregate_currency,
                 as_of_date=as_of_date,
@@ -598,19 +931,66 @@ class PortfolioService:
                 ]
             )
 
+        # R3: one valuation identity per snapshot build — positions, account and
+        # aggregate totals in THIS response share the same quote set; consumers
+        # (reports, alerts) reference this id + quote_refs instead of re-fetching
+        # a second price version. Deterministic over (as_of, method, quotes).
+        quote_refs = []
+        for account_payload_item in accounts_payload:
+            for position in account_payload_item.get("positions", []):
+                quote_refs.append(
+                    "{symbol}|{price}|{provider}|{kind}|{time}|{date}|{q}".format(
+                        symbol=position.get("symbol"),
+                        price=position.get("last_price"),
+                        provider=position.get("price_provider"),
+                        kind=position.get("price_kind"),
+                        time=position.get("price_provider_time"),
+                        date=position.get("price_date"),
+                        q=position.get("price_time_quality"),
+                    )
+                )
+        valuation_digest = hashlib.sha256(
+            "|".join(
+                [
+                    as_of_date.isoformat(),
+                    method,
+                    ",".join(sorted(str(a["account_id"]) for a in accounts_payload)),
+                    ";".join(sorted(quote_refs)),
+                    "price-policy-v2",
+                ]
+            ).encode("utf-8")
+        ).hexdigest()[:16]
+
         return {
             "as_of": as_of_date.isoformat(),
             "cost_method": method,
             "currency": aggregate_currency,
             "account_count": len(account_rows),
-            "total_cash": round(aggregate["total_cash"], 6),
+            "valuation_id": f"val-{valuation_digest}",
+            "quote_refs": [
+                {
+                    "account_id": account_payload_item["account_id"],
+                    "symbol": position.get("symbol"),
+                    "price": position.get("last_price"),
+                    "provider": position.get("price_provider"),
+                    "price_kind": position.get("price_kind"),
+                    "provider_time": position.get("price_provider_time"),
+                    "price_date": position.get("price_date"),
+                    "time_quality": position.get("price_time_quality"),
+                    "price_stale": position.get("price_stale"),
+                }
+                for account_payload_item in accounts_payload
+                for position in account_payload_item.get("positions", [])
+            ],
+            "total_cash": round(aggregate["total_cash"], 6) if aggregate.get("cash_known", True) else None,
             "total_market_value": round(aggregate["total_market_value"], 6),
-            "total_equity": round(aggregate["total_equity"], 6),
+            "total_equity": round(aggregate["total_equity"], 6) if aggregate.get("cash_known", True) else None,
             "realized_pnl": round(aggregate["realized_pnl"], 6),
             "unrealized_pnl": round(aggregate["unrealized_pnl"], 6),
             "fee_total": round(aggregate["fee_total"], 6),
             "tax_total": round(aggregate["tax_total"], 6),
             "fx_stale": aggregate["fx_stale"],
+            "cash_known": aggregate.get("cash_known", True),
             "data_quality": "partial" if aggregate["limitations"] else "ok",
             "limitations": aggregate["limitations"],
             "accounts": accounts_payload,
@@ -742,8 +1122,38 @@ class PortfolioService:
         event_priority = {"corp": 1, "trade": 2}
         events.sort(key=lambda item: (item[1], event_priority[item[0]], item[2]))
 
+        # R2 baseline takeover, identical to full replay: the latest account
+        # baseline at or before as_of replaces earlier history. A symbol absent
+        # from the active baseline means zero holdings at that date.
+        baseline_dates = [
+            row.trade_date
+            for row in trades
+            if (getattr(row, "event_type", None) or "trade").strip().lower() == "baseline"
+        ]
+        active_baseline_date = max(baseline_dates) if baseline_dates else None
+
         quantity_held = 0.0
+        if active_baseline_date is not None:
+            for row in trades:
+                record_type = (getattr(row, "event_type", None) or "trade").strip().lower()
+                if (
+                    record_type == "baseline"
+                    and row.trade_date == active_baseline_date
+                    and (
+                        self._normalize_symbol_for_position(row.symbol),
+                        self._normalize_market(row.market),
+                        self._normalize_currency(row.currency),
+                    ) == key
+                ):
+                    quantity_held += float(row.quantity or 0.0)
+
         for event_type, event_date, _, event in events:
+            if active_baseline_date is not None:
+                if event_date <= active_baseline_date:
+                    continue  # superseded by the active baseline
+                if (getattr(event, "event_type", None) or "trade").strip().lower() in BASELINE_LIKE_EVENT_TYPES:
+                    continue  # baseline/init rows after the active baseline are artifacts
+
             if event_type == "corp":
                 action_type = (event.action_type or "").strip().lower()
                 if action_type != "split_adjustment":
@@ -802,16 +1212,88 @@ class PortfolioService:
         event_priority = {"cash": 0, "corp": 1, "trade": 2}
         events.sort(key=lambda item: (item[1], event_priority[item[0]], item[2]))
 
+        # R2 baseline takeover: the LATEST confirmed baseline at or before
+        # as_of is the account's starting point. Everything dated at or before
+        # it (old init rows, older baselines, real trades, cash, corp actions)
+        # is superseded history — kept in the DB, excluded from replay, never
+        # double-counted on top of the baseline.
+        baseline_rows_by_date: Dict[date, List[Any]] = {}
+        for row in trades:
+            if (getattr(row, "event_type", None) or "").strip().lower() == "baseline":
+                baseline_rows_by_date.setdefault(row.trade_date, []).append(row)
+        active_baseline_date: Optional[date] = (
+            max(baseline_rows_by_date) if baseline_rows_by_date else None
+        )
+
         cash_balances: Dict[str, float] = defaultdict(float)
         fees_total_base = 0.0
         taxes_total_base = 0.0
         realized_pnl_base = 0.0
         fx_stale = False
+        baseline_date: Optional[date] = active_baseline_date
+        cash_known = True
+        superseded_count = 0
+        event_type_counts: Dict[str, int] = defaultdict(int)
 
         fifo_lots: Dict[Tuple[str, str, str], List[Dict[str, Any]]] = defaultdict(list)
         avg_state: Dict[Tuple[str, str, str], _AvgState] = defaultdict(_AvgState)
 
+        if active_baseline_date is not None:
+            # Seed positions from the confirmed baseline snapshot (replace, not add).
+            event_type_counts["baseline"] = len(baseline_rows_by_date[active_baseline_date])
+            for row in baseline_rows_by_date[active_baseline_date]:
+                key = (
+                    self._normalize_symbol_for_position(row.symbol),
+                    self._normalize_market(row.market),
+                    self._normalize_currency(row.currency),
+                )
+                qty = float(row.quantity or 0.0)
+                unit_cost = float(row.price or 0.0)
+                if qty <= 0:
+                    raise ValueError(f"Invalid baseline quantity for {row.symbol}")
+                if cost_method == "fifo":
+                    fifo_lots[key].append(
+                        {
+                            "symbol": key[0],
+                            "market": key[1],
+                            "currency": key[2],
+                            "open_date": active_baseline_date,
+                            "remaining_quantity": qty,
+                            "unit_cost": unit_cost,
+                            "source_trade_id": row.id,
+                        }
+                    )
+                else:
+                    state = avg_state[key]
+                    state.quantity += qty
+                    state.total_cost += qty * unit_cost
+            # Seed cash from the baseline-cash ledger note; no row = cash unknown.
+            baseline_cash_note = f"baseline-cash:{account.id}:{active_baseline_date.isoformat()}"
+            seeded_cash = [row for row in cash_ledger if row.note == baseline_cash_note]
+            if seeded_cash:
+                cash_row = seeded_cash[0]
+                cash_balances[self._normalize_currency(cash_row.currency)] = float(
+                    cash_row.amount or 0.0
+                )
+            else:
+                cash_known = False
+
         for event_type, event_date, _, event in events:
+            if active_baseline_date is not None:
+                if event_date <= active_baseline_date:
+                    # Superseded by the baseline: pre-baseline/baseline-date
+                    # history never replays on top of the confirmed snapshot.
+                    superseded_count += 1
+                    continue
+                if event_type == "trade" and (
+                    (getattr(event, "event_type", None) or "trade").strip().lower()
+                    in BASELINE_LIKE_EVENT_TYPES
+                ):
+                    # baseline/init rows dated after the active baseline are
+                    # historical artifacts, never real trades.
+                    superseded_count += 1
+                    continue
+
             if event_type == "cash":
                 currency = self._normalize_currency(event.currency)
                 amount = float(event.amount or 0.0)
@@ -836,12 +1318,23 @@ class PortfolioService:
                 if qty <= 0 or price <= 0:
                     raise ValueError(f"Invalid trade quantity or price for {event.symbol}")
 
+                # Event provenance (D12): baseline/init events establish the
+                # confirmed position snapshot — they do NOT move cash and are
+                # excluded from realized PnL / fee statistics. Real trades
+                # replay exactly as before.
+                record_type = (getattr(event, "event_type", None) or "trade").strip().lower()
+                event_type_counts[record_type] = event_type_counts.get(record_type, 0) + 1
+                if record_type == "baseline" and (baseline_date is None or event.trade_date < baseline_date):
+                    baseline_date = event.trade_date
+                is_baseline_like = record_type in BASELINE_LIKE_EVENT_TYPES
+
                 gross = qty * price
                 side = (event.side or "").lower().strip()
                 if side == "buy":
-                    cash_balances[key[2]] -= (gross + fee + tax)
+                    if not is_baseline_like:
+                        cash_balances[key[2]] -= (gross + fee + tax)
                     if cost_method == "fifo":
-                        unit_cost = (gross + fee + tax) / qty
+                        unit_cost = (gross + (0.0 if is_baseline_like else fee + tax)) / qty
                         fifo_lots[key].append(
                             {
                                 "symbol": key[0],
@@ -856,7 +1349,7 @@ class PortfolioService:
                     else:
                         state = avg_state[key]
                         state.quantity += qty
-                        state.total_cost += (gross + fee + tax)
+                        state.total_cost += gross + (0.0 if is_baseline_like else fee + tax)
                 elif side == "sell":
                     cash_balances[key[2]] += (gross - fee - tax)
                     proceeds_net = gross - fee - tax
@@ -886,21 +1379,22 @@ class PortfolioService:
                 else:
                     raise ValueError(f"Unsupported trade side: {event.side}")
 
-                fee_base, stale_fee, _ = self._convert_amount(
-                    amount=fee,
-                    from_currency=key[2],
-                    to_currency=account.base_currency,
-                    as_of_date=event_date,
-                )
-                tax_base, stale_tax, _ = self._convert_amount(
-                    amount=tax,
-                    from_currency=key[2],
-                    to_currency=account.base_currency,
-                    as_of_date=event_date,
-                )
-                fees_total_base += fee_base
-                taxes_total_base += tax_base
-                fx_stale = fx_stale or stale_fee or stale_tax
+                if not is_baseline_like:
+                    fee_base, stale_fee, _ = self._convert_amount(
+                        amount=fee,
+                        from_currency=key[2],
+                        to_currency=account.base_currency,
+                        as_of_date=event_date,
+                    )
+                    tax_base, stale_tax, _ = self._convert_amount(
+                        amount=tax,
+                        from_currency=key[2],
+                        to_currency=account.base_currency,
+                        as_of_date=event_date,
+                    )
+                    fees_total_base += fee_base
+                    taxes_total_base += tax_base
+                    fx_stale = fx_stale or stale_fee or stale_tax
                 continue
 
             if event_type == "corp":
@@ -938,7 +1432,7 @@ class PortfolioService:
                 else:
                     raise ValueError(f"Unsupported corporate action type: {event.action_type}")
 
-        position_rows, lot_rows, market_value_base, total_cost_base, stale_pos = self._build_positions(
+        position_rows, lot_rows, market_value_base, total_cost_base, stale_pos, coverage = self._build_positions(
             account=account,
             as_of_date=as_of_date,
             cost_method=cost_method,
@@ -970,6 +1464,14 @@ class PortfolioService:
             _portfolio_limitations_for_market(account.market),
             position_limitations,
         )
+        if not cash_known:
+            limitations = _merge_portfolio_limitations(
+                limitations,
+                [
+                    "cash unknown at baseline "
+                    f"{active_baseline_date.isoformat()}; total_cash/total_equity not computed"
+                ],
+            )
 
         account_payload = {
             "account_id": account.id,
@@ -980,17 +1482,26 @@ class PortfolioService:
             "base_currency": account.base_currency,
             "as_of": as_of_date.isoformat(),
             "cost_method": cost_method,
-            "total_cash": round(total_cash_base, 6),
+            "total_cash": round(total_cash_base, 6) if cash_known else None,
             "total_market_value": round(market_value_base, 6),
-            "total_equity": round(total_equity_base, 6),
+            "total_equity": round(total_equity_base, 6) if cash_known else None,
             "realized_pnl": round(realized_pnl_base, 6),
             "unrealized_pnl": round(unrealized_pnl_base, 6),
             "fee_total": round(fees_total_base, 6),
             "tax_total": round(taxes_total_base, 6),
             "fx_stale": fx_stale,
+            "cash_known": cash_known,
             "data_quality": "partial" if limitations else "ok",
             "limitations": limitations,
             "positions": position_rows,
+            "valuation_coverage": {
+                "valued": coverage["valued"],
+                "total": coverage["total"],
+                "unvalued_symbols": coverage["unvalued_symbols"],
+            },
+            "baseline_date": baseline_date.isoformat() if baseline_date else None,
+            "event_type_counts": dict(sorted(event_type_counts.items())) if event_type_counts else {},
+            "superseded_event_count": superseded_count if active_baseline_date is not None else None,
         }
 
         return {
@@ -998,6 +1509,7 @@ class PortfolioService:
             "payload": account_payload,
             "positions_cache": position_rows,
             "lots_cache": lot_rows,
+            "cash_known": cash_known,
             "total_cash": float(total_cash_base),
             "total_market_value": float(market_value_base),
             "total_equity": float(total_equity_base),
@@ -1023,6 +1535,7 @@ class PortfolioService:
         market_value_base = 0.0
         total_cost_base = 0.0
         fx_stale = False
+        unvalued_symbols: List[str] = []
 
         keys: Iterable[Tuple[str, str, str]]
         if cost_method == "fifo":
@@ -1103,15 +1616,52 @@ class PortfolioService:
                     to_currency=account.base_currency,
                     as_of_date=as_of_date,
                 )
-                unrealized_base = market_base - cost_base
+                if qty > EPS and total_cost <= EPS:
+                    # Confirmed position with unknown cost (R2): market value is
+                    # shown, but PnL must NOT be computed — neither as market
+                    # value nor as fake break-even zero.
+                    cost_basis_unknown = True
+                    unrealized_base = 0.0
+                else:
+                    cost_basis_unknown = False
+                    unrealized_base = market_base - cost_base
                 fx_stale = fx_stale or stale_market or stale_cost
             else:
+                # Missing price: keep shares/cost visible, contribute zero
+                # valuation, and surface the gap explicitly (T03). Never fake
+                # a zero-value total-equity as if it were complete.
+                cost_basis_unknown = qty > EPS and total_cost <= EPS
                 market_base = 0.0
-                cost_base = 0.0
+                cost_base, stale_cost, _ = self._convert_amount(
+                    amount=total_cost,
+                    from_currency=currency,
+                    to_currency=account.base_currency,
+                    as_of_date=as_of_date,
+                )
+                fx_stale = fx_stale or stale_cost
                 unrealized_base = 0.0
+                unvalued_symbols.append(symbol)
+                if price_info.source == "identity_unconfirmed":
+                    limitations = list(limitations) + [
+                        f"identity unconfirmed for {symbol}; valuation paused until the "
+                        "instrument type (stock/etf/otc_fund) is confirmed"
+                    ]
+                else:
+                    limitations = list(limitations) + [
+                        f"price unavailable for {symbol}; shares and cost kept, valuation excluded"
+                    ]
+            # 10-24：数值可用不代表时效已验证；逐层传递到account/aggregate。
+            if price_info.is_available and (price_info.time_quality == "unknown" or not price_info.price_date):
+                limitations = list(limitations) + [f"price source time unknown for {symbol}; freshness unverified, not a current-price trigger"]
+            if price_info.is_available and price_info.is_stale:
+                limitations = list(limitations) + [f"stale price for {symbol}; reference valuation only"]
+            if cost_basis_unknown:
+                limitations = list(limitations) + [
+                    f"cost basis unknown for {symbol}; quantity and market value kept, PnL not computed"
+                ]
 
             unrealized_pct = None
-            if abs(cost_base) > EPS:
+            if price_info.is_available and not cost_basis_unknown and abs(cost_base or 0.0) > EPS:
                 unrealized_pct = unrealized_base / cost_base * 100.0
 
             position_rows.append(
@@ -1132,40 +1682,67 @@ class PortfolioService:
                     "price_date": price_info.price_date.isoformat() if price_info.price_date else None,
                     "price_stale": price_info.is_stale,
                     "price_available": price_info.is_available,
+                    "price_kind": price_info.price_kind,
+                    "price_provider_time": price_info.provider_time,
+                    "price_fetched_at": price_info.fetched_at,
+                    "price_time_quality": price_info.time_quality,
+                    # R4/F09：共享上游披露（akshare ETF / efinance ETF / 基金净值
+                    # 同属 eastmoney 组），报告不得称其为独立双源。
+                    "price_upstream_group": upstream_group_for(price_info.provider),
+                    "cost_basis_unknown": cost_basis_unknown,
                     "data_quality": "partial" if limitations else "ok",
                     "limitations": limitations,
                 }
             )
 
             market_value_base += market_base
-            total_cost_base += cost_base
+            if price_info.is_available:
+                total_cost_base += cost_base
 
-        return position_rows, lot_rows, market_value_base, total_cost_base, fx_stale
+        coverage = {
+            "valued": len(position_rows) - len(unvalued_symbols),
+            "total": len(position_rows),
+            "unvalued_symbols": unvalued_symbols,
+        }
+        return position_rows, lot_rows, market_value_base, total_cost_base, fx_stale, coverage
 
     def _resolve_position_price(
         self,
         *,
         symbol: str,
         as_of_date: date,
-        realtime_prices: Optional[Dict[str, Tuple[Optional[float], Optional[str]]]] = None,
+        realtime_prices: Optional[Dict[str, Dict[str, Any]]] = None,
         include_realtime: bool = True,
     ) -> _ResolvedPositionPrice:
         today = date.today()
 
         if include_realtime and as_of_date == today:
             if realtime_prices is None:
-                realtime_price, provider = self._fetch_realtime_position_price(symbol)
+                quote_info = self._fetch_realtime_position_price(symbol)
             else:
-                realtime_price, provider = realtime_prices.get(symbol, (None, None))
-            if realtime_price is not None and realtime_price > 0:
+                quote_info = realtime_prices.get(symbol)
+            if quote_info is not None and quote_info.get("kind") == "identity_paused":
+                # Identity unconfirmed and ambiguous (R3/F06): pause THIS
+                # symbol's valuation — no exchange quote, no NAV guess, and no
+                # history-close fallback either.
                 return _ResolvedPositionPrice(
-                    price=float(realtime_price),
-                    source="realtime_quote",
-                    price_date=today,
-                    is_stale=False,
-                    is_available=True,
-                    provider=provider,
+                    price=0.0,
+                    source="identity_unconfirmed",
+                    price_date=None,
+                    is_stale=True,
+                    is_available=False,
+                    provider="identity_unconfirmed",
+                    price_kind="identity_paused",
+                    time_quality="unknown",
                 )
+            if quote_info is not None:
+                price = float(quote_info.get("price") or 0.0)
+                if price > 0:
+                    return self._build_realtime_resolved_price(
+                        symbol=symbol,
+                        as_of_date=as_of_date,
+                        quote_info=quote_info,
+                    )
 
         close = self.repo.get_latest_close_with_date(symbol=symbol, as_of=as_of_date)
         if close is not None:
@@ -1177,6 +1754,7 @@ class PortfolioService:
                     price_date=close_date,
                     is_stale=close_date < as_of_date,
                     is_available=True,
+                    price_kind="close",
                 )
 
         return _ResolvedPositionPrice(
@@ -1185,12 +1763,154 @@ class PortfolioService:
             price_date=None,
             is_stale=True,
             is_available=False,
+            price_kind="missing",
         )
+
+    def _build_realtime_resolved_price(
+        self,
+        *,
+        symbol: str,
+        as_of_date: date,
+        quote_info: Dict[str, Any],
+        now_cn: Optional[datetime] = None,
+    ) -> _ResolvedPositionPrice:
+        """Turn a fetched quote/NAV into a resolved price with honest time semantics.
+
+        Rules (T1/T02):
+        - price_date comes from the provider timestamp / NAV date, never from
+          the fetch clock. A positive price alone no longer means "today".
+        - NAV: never treated as realtime; stale only when the latest published
+          NAV lags the as-of date beyond NAV_STALENESS_MAX_LAG_DAYS (QDII T-2+
+          publication is normal).
+        - Realtime quote with provider time:
+            * provider date == as-of date and the CN session is live right now
+              -> stale when the quote age exceeds 60 minutes;
+            * provider date == as-of date, session closed -> official close of
+              today, not stale;
+            * provider date < as-of date and today's CN session has opened
+              -> stale (previous-session price while a newer session trades);
+            * provider date < as-of date and today's session has not opened
+              (pre-market / non-trading day) -> latest official close, not
+              stale, price_date kept honest.
+        - Realtime quote without provider time: the source moment is unknown —
+          price_date stays None and time_quality='unknown'; the valuation is
+          usable but must be reported as time-unknown, never as realtime.
+        """
+
+        price = float(quote_info.get("price"))
+        provider = quote_info.get("provider")
+        kind = str(quote_info.get("kind") or "realtime")
+        provider_time_raw = quote_info.get("provider_time")
+        fetched_at_raw = quote_info.get("fetched_at")
+
+        provider_dt: Optional[datetime] = None
+        if isinstance(provider_time_raw, datetime):
+            provider_dt = provider_time_raw
+        elif isinstance(provider_time_raw, str) and provider_time_raw:
+            try:
+                provider_dt = datetime.fromisoformat(provider_time_raw)
+            except ValueError:
+                provider_dt = None
+        fetched_dt: Optional[datetime] = None
+        if isinstance(fetched_at_raw, datetime):
+            fetched_dt = fetched_at_raw
+        elif isinstance(fetched_at_raw, str) and fetched_at_raw:
+            try:
+                fetched_dt = datetime.fromisoformat(fetched_at_raw)
+            except ValueError:
+                fetched_dt = None
+
+        if kind == "nav":
+            nav_date = provider_dt.date() if provider_dt is not None else None
+            # NAV carries DATE precision only: keep the provider time verbatim
+            # (a plain date string); never fabricate an intraday publish time (R3).
+            provider_time_iso = (
+                str(provider_time_raw) if provider_time_raw else None
+            )
+            return _ResolvedPositionPrice(
+                price=price,
+                source="fund_nav",
+                price_date=nav_date,
+                is_stale=(
+                    nav_date is None
+                    or (as_of_date - nav_date).days > NAV_STALENESS_MAX_LAG_DAYS
+                ),
+                is_available=True,
+                provider=provider,
+                price_kind="nav",
+                provider_time=provider_time_iso,
+                fetched_at=fetched_at_raw if isinstance(fetched_at_raw, str) else None,
+                time_quality="valid" if nav_date is not None else "unknown",
+            )
+
+        # Realtime quote path.
+        now_cn = now_cn or datetime.now(_CN_TZ)
+        session_live = self._cn_session_live(now_cn, as_of_date)
+        session_opened_today = self._cn_session_opened_today(now_cn, as_of_date)
+
+        if provider_dt is not None:
+            if provider_dt.tzinfo is None:
+                provider_dt = provider_dt.replace(tzinfo=_CN_TZ)
+            provider_dt_cn = provider_dt.astimezone(_CN_TZ)
+            provider_date = provider_dt_cn.date()
+            if provider_date == as_of_date:
+                is_stale = bool(
+                    session_live
+                    and fetched_dt is not None
+                    and (
+                        (fetched_dt.astimezone(_CN_TZ) - provider_dt_cn).total_seconds()
+                        > REALTIME_STALENESS_MAX_AGE_SECONDS
+                    )
+                )
+            else:
+                # Provider quote from an earlier date than the as-of date.
+                is_stale = bool(session_opened_today)
+            time_quality = "valid"
+        else:
+            # No provider time disclosed: the source moment is UNKNOWN — keep
+            # price_date None (never fill it with the fetch date) and mark
+            # time_quality='unknown'; consumers must not present it as
+            # realtime/normal (R3/F07).
+            provider_date = None
+            is_stale = False
+            time_quality = "unknown"
+
+        return _ResolvedPositionPrice(
+            price=price,
+            source="realtime_quote",
+            price_date=provider_date,
+            is_stale=is_stale,
+            is_available=True,
+            provider=provider,
+            price_kind="realtime",
+            provider_time=(
+                provider_dt.astimezone(_CN_TZ).isoformat() if provider_dt is not None else None
+            ),
+            fetched_at=fetched_at_raw if isinstance(fetched_at_raw, str) else None,
+            time_quality=time_quality,
+        )
+
+    @staticmethod
+    def _cn_session_live(now_cn: datetime, check_date: date) -> bool:
+        """True when now (CN time) falls inside the A-share continuous session on a trading day."""
+        if check_date != now_cn.date():
+            return False
+        if not is_market_open("cn", check_date):
+            return False
+        minutes = now_cn.hour * 60 + now_cn.minute
+        return (9 * 60 + 25) <= minutes <= (15 * 60 + 5)
+
+    @staticmethod
+    def _cn_session_opened_today(now_cn: datetime, check_date: date) -> bool:
+        """True when the CN session for check_date has already opened (09:25 or later)."""
+        if check_date != now_cn.date():
+            return check_date < now_cn.date()
+        return is_market_open("cn", check_date) and (now_cn.hour * 60 + now_cn.minute) >= (9 * 60 + 25)
 
     def _prefetch_realtime_position_prices(
         self,
         symbols: Iterable[str],
-    ) -> Dict[str, Tuple[Optional[float], Optional[str]]]:
+    ) -> Dict[str, Dict[str, Any]]:
         unique_symbols = sorted({symbol for symbol in symbols if symbol})
         if not unique_symbols:
             return {}
@@ -1199,61 +1919,134 @@ class PortfolioService:
         # the manager itself is discarded so per-symbol workers cannot serialize through its
         # per-fetcher call locks when individual reads still need a live fetch (e.g. mixed
         # markets, cache miss, or bulk source returning fewer rows than requested).
-        if len(unique_symbols) >= 5:
+        # Definite-OTC funds never touch the stock prefetch (T01).
+        listed_symbols = [
+            symbol
+            for symbol in unique_symbols
+            if classify_cn_symbol(self._normalize_symbol_for_position(symbol)) != "otc"
+        ]
+        if len(listed_symbols) >= 5:
             try:
                 from data_provider.base import DataFetcherManager
 
-                DataFetcherManager().prefetch_realtime_quotes(unique_symbols)
+                DataFetcherManager().prefetch_realtime_quotes(listed_symbols)
             except Exception as exc:
                 logger.warning("Failed to prefetch realtime portfolio quotes: %s", exc)
 
-        if len(unique_symbols) == 1:
-            symbol = unique_symbols[0]
-            return {symbol: self._fetch_realtime_position_price(symbol)}
+        results: Dict[str, Dict[str, Any]] = {}
+        pending = list(unique_symbols)
+        if len(pending) == 1:
+            symbol = pending[0]
+            info = self._fetch_realtime_position_price(symbol)
+            if info is not None:
+                results[symbol] = info
+            return results
 
-        results: Dict[str, Tuple[Optional[float], Optional[str]]] = {}
-        max_workers = min(PORTFOLIO_REALTIME_QUOTE_MAX_WORKERS, len(unique_symbols))
+        max_workers = min(PORTFOLIO_REALTIME_QUOTE_MAX_WORKERS, len(pending))
         with ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="portfolio-quote") as executor:
             futures = {
                 executor.submit(self._fetch_realtime_position_price, symbol): symbol
-                for symbol in unique_symbols
+                for symbol in pending
             }
             for future in as_completed(futures):
                 symbol = futures[future]
                 try:
-                    results[symbol] = future.result()
+                    info = future.result()
                 except Exception as exc:  # pragma: no cover - defensive guard for patched fetchers
                     logger.warning("Failed to prefetch realtime portfolio price for %s: %s", symbol, exc)
-                    results[symbol] = (None, None)
+                    continue
+                if info is not None:
+                    results[symbol] = info
 
         return results
 
     @staticmethod
-    def _fetch_realtime_position_price(symbol: str) -> Tuple[Optional[float], Optional[str]]:
-        try:
-            from data_provider.base import DataFetcherManager
+    def _fetch_realtime_position_price(symbol: str) -> Optional[Dict[str, Any]]:
+        """Fetch a live valuation price for one position, routed by asset identity.
 
-            fetcher_manager = DataFetcherManager()
-            quote = fetcher_manager.get_realtime_quote(symbol, log_final_failure=False)
+        Returns a dict {price, provider, kind, provider_time, fetched_at}, or
+        a {"kind": "identity_paused", ...} marker when the symbol's identity is
+        unconfirmed and ambiguous (R3/F06), or None when nothing usable came
+        back. Routing order:
+        1. CONFIRMED identity (portfolio_instrument_identities, confirmed at
+           baseline time or via the controlled identity endpoint):
+           otc_fund -> NAV; stock/etf/index -> exchange quote.
+        2. Heuristic (classify_cn_symbol): definite OTC -> NAV (stock APIs
+           never called); ETF/LOF registry hits -> exchange; 'ambiguous'
+           (real stock/fund code collision, e.g. 000001/003096) or 'unknown'
+           (OTC registry unavailable outside listed ranges) -> identity PAUSED.
+           A stock-quote failure is NEVER answered with the same-code fund NAV
+           and vice versa — that guess is exactly what T01 forbids.
+        """
+        fetched_at = datetime.now(_CN_TZ).isoformat()
+        normalized = _strip_symbol_suffix(symbol)
+        route_for_symbol = None
+        confirmed_kind = None
+        try:
+            from src.services.instrument_identity import (
+                InstrumentIdentityService,
+                route_for_symbol,
+            )
+
+            confirmed_kind = InstrumentIdentityService().confirmed_kind(symbol)
         except Exception as exc:
-            logger.warning("Failed to fetch realtime portfolio price for %s: %s", symbol, exc)
-            return None, None
+            logger.warning("[identity] registry unavailable, heuristic routing only: %s", exc)
+        if route_for_symbol is not None:
+            route = route_for_symbol(symbol, confirmed_kind, classify=classify_cn_symbol)
+        else:
+            # Registry broken: fall back to pure heuristics (still no guessing
+            # across asset classes — ambiguous/unknown stay paused).
+            heuristic = classify_cn_symbol(symbol)
+            route = "nav" if heuristic == "otc" else ("exchange" if heuristic == "listed" else "paused_identity")
 
-        if quote is None:
-            return None, None
+        def nav_quote() -> Optional[Dict[str, Any]]:
+            nav_info = fetch_latest_nav(normalized)
+            if nav_info is None:
+                return None
+            nav_date = nav_info["nav_date"]
+            # NAV publishes with DATE precision only — keep the provider time
+            # as the nav date string; never fabricate a 15:00 publish time (R3).
+            if isinstance(nav_date, (datetime, date)):
+                provider_time = nav_date.isoformat()
+            else:
+                provider_time = None
+            try:
+                nav_value = float(nav_info["nav"])
+            except (TypeError, ValueError):
+                return None
+            if nav_value is None or nav_value <= 0:
+                return None
+            return {
+                "price": nav_value,
+                "provider": "akshare_fund_nav",
+                "upstream_group": upstream_group_for("akshare_fund_nav"),
+                "kind": "nav",
+                "provider_time": provider_time,
+                "fetched_at": fetched_at,
+            }
 
-        price = getattr(quote, "price", None)
-        try:
-            numeric_price = float(price)
-        except (TypeError, ValueError):
-            return None, None
+        if route == "paused_identity":
+            return {
+                "kind": "identity_paused",
+                "price": None,
+                "provider": "identity_unconfirmed",
+                "provider_time": None,
+                "fetched_at": fetched_at,
+            }
+        if route == "nav":
+            return nav_quote()
 
-        if numeric_price <= 0:
-            return None, None
+        stock_quote = _fetch_stock_realtime_quote(symbol, fetched_at)
+        if stock_quote is not None:
+            return stock_quote
+        return None
 
-        source = getattr(quote, "source", None)
-        provider = getattr(source, "value", None) or (str(source) if source is not None else None)
-        return numeric_price, provider
+    @staticmethod
+    def _normalize_prefetch_symbols(symbols) -> "List[str]":
+        return [
+            symbol for symbol in symbols
+            if classify_cn_symbol(symbol) != "otc"
+        ]
 
     @staticmethod
     def _normalize_symbol_for_storage(symbol: str) -> str:
@@ -1676,6 +2469,7 @@ class PortfolioService:
             "currency": row.currency,
             "trade_date": row.trade_date.isoformat() if row.trade_date else "",
             "side": row.side,
+            "event_type": (getattr(row, "event_type", None) or "trade"),
             "quantity": float(row.quantity),
             "price": float(row.price),
             "fee": float(row.fee),

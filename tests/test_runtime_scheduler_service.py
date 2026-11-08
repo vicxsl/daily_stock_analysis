@@ -153,7 +153,8 @@ class RuntimeSchedulerServiceTestCase(unittest.TestCase):
             with self.assertRaisesRegex(OSError, "not permitted"):
                 _run_scheduled_analysis_process(MagicMock(), None, {})
 
-    def test_child_restores_due_occurrence_and_returns_skip_status(self) -> None:
+    @patch("src.services.runtime_scheduler._exit_scheduled_analysis_worker")
+    def test_child_restores_due_occurrence_and_returns_skip_status(self, exit_worker) -> None:
         due = datetime(2026, 10, 2, 18)
         queue = MagicMock()
         worker = MagicMock()
@@ -164,6 +165,7 @@ class RuntimeSchedulerServiceTestCase(unittest.TestCase):
             "src.services.runtime_scheduler.RuntimeSchedulerService", return_value=worker,
         ) as service_type:
             _run_scheduled_analysis_process(queue, None, {"_scheduled_for": due.isoformat(), "no_notify": True})
+        exit_worker.assert_called_once()
         service_type.assert_called_once_with(schedule_args_overrides={"no_notify": True})
         worker._run_analysis_locked.assert_called_once_with(None, scheduled_for=due)
         self.assertEqual(queue.put.call_args.args[0]["skipped"], "scheduled_occurrence_already_claimed")

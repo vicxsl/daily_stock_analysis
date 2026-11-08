@@ -167,6 +167,21 @@ def test_tencent_realtime_success_logs_endpoint(caplog, monkeypatch, akshare_fet
     assert "[实时行情-腾讯] 601006 大秦铁路:" in caplog.text
 
 
+def test_etf_tencent_source_uses_single_symbol_quote(monkeypatch, akshare_fetcher):
+    expected = object()
+
+    def tencent_quote(stock_code):
+        return expected
+
+    def etf_quote(stock_code):
+        pytest.fail("ETF bulk source must not handle Tencent routing")
+
+    monkeypatch.setattr(akshare_fetcher, "_get_stock_realtime_quote_tencent", tencent_quote)
+    monkeypatch.setattr(akshare_fetcher, "_get_etf_realtime_quote", etf_quote)
+
+    assert akshare_fetcher.get_realtime_quote("516630", source="tencent") is expected
+
+
 def test_tencent_realtime_volume_keeps_share_unit_when_turnover_matches(monkeypatch, akshare_fetcher):
     breaker = _DummyCircuitBreaker()
     monkeypatch.setattr("data_provider.akshare_fetcher.get_realtime_circuit_breaker", lambda: breaker)

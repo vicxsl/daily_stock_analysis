@@ -93,6 +93,10 @@ class PortfolioRiskService:
             "cost_method": cost_method,
             "currency": snapshot["currency"],
             "thresholds": thresholds,
+            "valuation_id": snapshot.get("valuation_id"),
+            "quote_refs": snapshot.get("quote_refs", []),
+            "data_quality": snapshot.get("data_quality", "unknown"),
+            "limitations": snapshot.get("limitations", []),
             "concentration": concentration,
             "sector_concentration": sector_concentration,
             "drawdown": drawdown,
@@ -332,9 +336,14 @@ class PortfolioRiskService:
             "classified_count": 0,
             "unclassified_count": 0,
             "failed_count": 0,
+            # P2 2026-10-24：按资产身份路由行业分类。场外基金与 ETF 无
+            # 披露材料时行业覆盖未知，不计入失败，也不再调用股票板块接口。
+            "otc_fund_count": 0,
+            "etf_count": 0,
         }
         errors: List[str] = []
         board_cache: Dict[Tuple[str, str], str] = {}
+        kind_cache: Dict[str, Optional[str]] = {}
 
         for account in snapshot.get("accounts", []):
             for pos in account.get("positions", []):
@@ -355,6 +364,7 @@ class PortfolioRiskService:
                 sector = self._resolve_primary_sector(
                     symbol=symbol,
                     market=market,
+                    asset_kind=self._resolve_asset_kind(symbol, market, kind_cache),
                     board_cache=board_cache,
                     coverage=coverage,
                     errors=errors,
@@ -365,17 +375,24 @@ class PortfolioRiskService:
         rows = []
         for sector, exposure in sector_exposure.items():
             weight = (exposure / total_mv * 100.0) if total_mv > 0 else 0.0
+            # UNCLASSIFIED 表示覆盖未知（基金/ETF/非CN/身份未确认/查询失败），
+            # 不是真实行业，不参与集中度告警判定，只在 top_sectors 中可见。
+            is_coverage_gap = sector == "UNCLASSIFIED"
             rows.append(
                 {
                     "sector": sector,
                     "market_value_base": round(exposure, 6),
                     "weight_pct": round(weight, 4),
                     "symbol_count": len(sector_symbols.get(sector, set())),
-                    "is_alert": bool(weight >= threshold_pct),
+                    "is_alert": bool(weight >= threshold_pct and not is_coverage_gap),
+                    "coverage_gap": is_coverage_gap,
                 }
             )
         rows.sort(key=lambda item: item["market_value_base"], reverse=True)
-        top_weight = rows[0]["weight_pct"] if rows else 0.0
+        top_weight = next(
+            (item["weight_pct"] for item in rows if not item["coverage_gap"]),
+            0.0,
+        )
 
         return {
             "total_market_value": round(total_mv, 6),
@@ -386,6 +403,60 @@ class PortfolioRiskService:
             "errors": errors[:20],
         }
 
+    def _resolve_asset_kind(
+        self,
+        symbol: str,
+        market: str,
+        kind_cache: Dict[str, Optional[str]],
+    ) -> Optional[str]:
+        """Resolve one symbol's asset kind via the valuation identity mechanism.
+
+        Mirrors the routing order of portfolio_service._fetch_valuation_price:
+        confirmed registry kind first (stock/etf/index/otc_fund), then the
+        classify_cn_symbol heuristic (otc -> otc_fund; listed -> etf/stock).
+        Unconfirmed/ambiguous/unknown returns None — callers must NOT guess by
+        code prefix or "cn market" alone (P2).
+        """
+        cache_key = f"{symbol}|{market}"
+        if cache_key in kind_cache:
+            return kind_cache[cache_key]
+
+        kind: Optional[str] = None
+        confirmed_kind = None
+        try:
+            from src.services.instrument_identity import InstrumentIdentityService
+
+            confirmed_kind = InstrumentIdentityService().confirmed_kind(symbol)
+        except Exception as exc:  # registry unavailable -> heuristic only
+            logger.warning("[sector] identity registry unavailable for %s: %s", symbol, exc)
+
+        if confirmed_kind in ("stock", "etf", "index", "otc_fund"):
+            kind = confirmed_kind
+        else:
+            try:
+                from src.services.fund_nav import classify_cn_symbol
+
+                heuristic = classify_cn_symbol(symbol)
+            except Exception as exc:
+                logger.warning("[sector] classifier unavailable for %s: %s", symbol, exc)
+                heuristic = ""
+            if heuristic == "otc":
+                kind = "otc_fund"
+            elif heuristic == "listed":
+                try:
+                    from data_provider.akshare_fetcher import _is_etf_code
+
+                    kind = "etf" if _is_etf_code(symbol) else "stock"
+                except Exception as exc:
+                    logger.warning("[sector] etf heuristic unavailable for %s: %s", symbol, exc)
+                    kind = None
+            else:
+                # ambiguous / unknown / classifier failure: identity unconfirmed.
+                kind = None
+
+        kind_cache[cache_key] = kind
+        return kind
+
     def _resolve_primary_sector(
         self,
         *,
@@ -394,12 +465,30 @@ class PortfolioRiskService:
         board_cache: Dict[Tuple[str, str], str],
         coverage: Dict[str, int],
         errors: List[str],
+        asset_kind: Optional[str] = None,
     ) -> str:
         cache_key = (symbol, market)
         if cache_key in board_cache:
             return board_cache[cache_key]
 
         if market != "cn":
+            coverage["unclassified_count"] += 1
+            board_cache[cache_key] = "UNCLASSIFIED"
+            return board_cache[cache_key]
+
+        # 资产身份路由（P2）：场外基金与 ETF 不调用股票板块接口——
+        # 它们的行业暴露应来自已取得的披露材料；DSA 侧没有披露库，
+        # 没有材料就保留 UNCLASSIFIED（覆盖未知），不强行穿透、不
+        # 生成确定的行业集中结论。身份未确认同样不猜。
+        if asset_kind == "otc_fund":
+            coverage["otc_fund_count"] += 1
+            board_cache[cache_key] = "UNCLASSIFIED"
+            return board_cache[cache_key]
+        if asset_kind == "etf":
+            coverage["etf_count"] += 1
+            board_cache[cache_key] = "UNCLASSIFIED"
+            return board_cache[cache_key]
+        if asset_kind not in ("stock", "index"):
             coverage["unclassified_count"] += 1
             board_cache[cache_key] = "UNCLASSIFIED"
             return board_cache[cache_key]

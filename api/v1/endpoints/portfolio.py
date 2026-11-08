@@ -5,7 +5,7 @@ from __future__ import annotations
 
 import logging
 from datetime import date
-from typing import Optional
+from typing import Any, Dict, Optional
 
 from fastapi import APIRouter, File, Form, HTTPException, Query, UploadFile
 from fastapi.responses import JSONResponse
@@ -18,6 +18,8 @@ from api.v1.schemas.portfolio import (
     PortfolioAccountItem,
     PortfolioAccountListResponse,
     PortfolioAccountUpdateRequest,
+    PortfolioBaselineCreateRequest,
+    PortfolioBaselineResponse,
     PortfolioCashLedgerListResponse,
     PortfolioCashLedgerCreateRequest,
     PortfolioCorporateActionListResponse,
@@ -29,6 +31,8 @@ from api.v1.schemas.portfolio import (
     PortfolioImportCommitResponse,
     PortfolioImportParseResponse,
     PortfolioImportTradeItem,
+    PortfolioInstrumentIdentityRequest,
+    PortfolioInstrumentIdentityResponse,
     PortfolioPositionAnalysisRequest,
     PortfolioRiskResponse,
     PortfolioSnapshotResponse,
@@ -182,6 +186,7 @@ def create_trade(request: PortfolioTradeCreateRequest) -> PortfolioEventCreatedR
             currency=request.currency,
             trade_uid=request.trade_uid,
             note=request.note,
+            event_type=request.event_type,
         )
         return PortfolioEventCreatedResponse(**data)
     except PortfolioBusyError as exc:
@@ -196,6 +201,104 @@ def create_trade(request: PortfolioTradeCreateRequest) -> PortfolioEventCreatedR
         raise _internal_error("Create trade failed", exc)
 
 
+@router.post(
+    "/baseline",
+    response_model=PortfolioBaselineResponse,
+    responses={400: {"model": ErrorResponse}, 409: {"model": ErrorResponse}, 500: {"model": ErrorResponse}},
+    summary="Record confirmed account baseline",
+    description=(
+        "Create one human-confirmed account baseline (D12/R2): the LATEST confirmed "
+        "baseline at or before as_of REPLACES earlier history during replay — old "
+        "init rows, older baselines and pre-baseline events are superseded (kept "
+        "for history, never double-counted). positions may be empty (confirmed "
+        "empty account, cash must then be declared); cost_per_unit None/0 = cost "
+        "unknown (PnL not computed); cash None = unknown (never substituted with "
+        "0), cash 0 = confirmed zero. A baseline cannot share its date with real "
+        "events (ordering undecidable). Re-submitting the identical baseline is "
+        "idempotent; different content for the same date returns 409 — "
+        "re-confirmation uses a new baseline_date. asset_kind per position "
+        "confirms the instrument identity used for valuation routing."
+    ),
+)
+def create_baseline(request: PortfolioBaselineCreateRequest) -> PortfolioBaselineResponse:
+    service = PortfolioService()
+    try:
+        data = service.record_baseline(
+            account_id=request.account_id,
+            baseline_date=request.baseline_date,
+            positions=[item.model_dump() for item in request.positions],
+            cash=request.cash,
+            cash_currency=request.cash_currency,
+            note=request.note,
+        )
+        return PortfolioBaselineResponse(**data)
+    except PortfolioBusyError as exc:
+        raise _conflict_error(error="portfolio_busy", message=str(exc))
+    except PortfolioConflictError as exc:
+        raise _conflict_error(error="conflict", message=str(exc))
+    except ValueError as exc:
+        raise _bad_request(exc)
+    except Exception as exc:
+        raise _internal_error("Create baseline failed", exc)
+
+
+@router.get(
+    "/instrument-identities",
+    response_model=Dict[str, Any],
+    summary="Look up confirmed instrument identities",
+    description=(
+        "Confirmed instrument identities used for valuation routing (R3). "
+        "?symbol=600887 looks one up (aliases like SH600887/600887.SH normalize "
+        "to the same row); omit to list all."
+    ),
+)
+def get_instrument_identities(symbol: Optional[str] = Query(None)) -> Dict[str, Any]:
+    from src.services.instrument_identity import InstrumentIdentityService
+
+    service = InstrumentIdentityService()
+    if symbol:
+        identity = service.get(symbol)
+        return {"symbol": symbol, "identity": identity}
+    return {"identities": []}
+
+
+@router.post(
+    "/instrument-identity",
+    response_model=PortfolioInstrumentIdentityResponse,
+    responses={400: {"model": ErrorResponse}, 500: {"model": ErrorResponse}},
+    summary="Confirm one instrument identity",
+    description=(
+        "Upsert one CONFIRMED instrument identity (R3/F06): otc_fund routes to "
+        "fund NAV, stock/etf/index to the exchange quote. This is instrument "
+        "metadata, not an account fact; ambiguous/unconfirmed symbols have "
+        "their valuation paused instead of guessed. Client-side fact-write "
+        "gating applies to this endpoint as well."
+    ),
+)
+def confirm_instrument_identity(
+    request: PortfolioInstrumentIdentityRequest,
+) -> PortfolioInstrumentIdentityResponse:
+    from src.services.instrument_identity import InstrumentIdentityService
+
+    service = InstrumentIdentityService()
+    try:
+        identity = service.upsert(
+            symbol=request.symbol,
+            kind=request.kind,
+            market=request.market,
+            currency=request.currency,
+            source="manual",
+            confirmed_by=request.confirmed_by,
+            note=request.note,
+        )
+        full = service.get(request.symbol) or identity
+        return PortfolioInstrumentIdentityResponse(ok=True, identity=full)
+    except ValueError as exc:
+        raise _bad_request(exc)
+    except Exception as exc:
+        raise _internal_error("Confirm instrument identity failed", exc)
+
+
 @router.get(
     "/trades",
     response_model=PortfolioTradeListResponse,
@@ -208,6 +311,9 @@ def list_trades(
     date_to: Optional[date] = Query(None, description="Trade date to"),
     symbol: Optional[str] = Query(None, description="Optional stock symbol filter"),
     side: Optional[str] = Query(None, description="Optional side filter: buy/sell"),
+    event_type: Optional[str] = Query(
+        None, description="Optional event type filter: trade/baseline/init"
+    ),
     page: int = Query(1, ge=1),
     page_size: int = Query(20, ge=1, le=100),
 ) -> PortfolioTradeListResponse:
@@ -219,6 +325,7 @@ def list_trades(
             date_to=date_to,
             symbol=symbol,
             side=side,
+            event_type=event_type,
             page=page,
             page_size=page_size,
         )

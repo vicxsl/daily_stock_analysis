@@ -125,7 +125,7 @@ class PortfolioServiceTestCase(unittest.TestCase):
             currency="CNY",
         )
 
-        with patch.object(PortfolioService, "_fetch_realtime_position_price", return_value=(125.0, "unit-test")):
+        with patch.object(PortfolioService, "_fetch_realtime_position_price", return_value={"price": 125.0, "provider": "unit-test", "kind": "realtime", "provider_time": None, "fetched_at": None}):
             snapshot = self.service.get_portfolio_snapshot(account_id=aid, as_of=today, cost_method="fifo")
 
         pos = snapshot["accounts"][0]["positions"][0]
@@ -152,7 +152,7 @@ class PortfolioServiceTestCase(unittest.TestCase):
         )
         self._save_close("600519", today - timedelta(days=1), 110.0)
 
-        with patch.object(PortfolioService, "_fetch_realtime_position_price", return_value=(125.0, "unit-test")):
+        with patch.object(PortfolioService, "_fetch_realtime_position_price", return_value={"price": 125.0, "provider": "unit-test", "kind": "realtime", "provider_time": None, "fetched_at": None}):
             snapshot = self.service.get_portfolio_snapshot(account_id=aid, as_of=today, cost_method="fifo")
 
         pos = snapshot["accounts"][0]["positions"][0]
@@ -161,7 +161,10 @@ class PortfolioServiceTestCase(unittest.TestCase):
         self.assertAlmostEqual(pos["unrealized_pnl_base"], 250.0, places=6)
         self.assertEqual(pos["price_source"], "realtime_quote")
         self.assertEqual(pos["price_provider"], "unit-test")
-        self.assertEqual(pos["price_date"], today.isoformat())
+        # R3: 该 mock 未披露 provider_time → price_date 未知（None），
+        # time_quality=unknown，不填获取日期。
+        self.assertIsNone(pos["price_date"])
+        self.assertEqual(pos["price_time_quality"], "unknown")
         self.assertFalse(pos["price_stale"])
         self.assertTrue(pos["price_available"])
 
@@ -181,7 +184,7 @@ class PortfolioServiceTestCase(unittest.TestCase):
         )
         self._save_close("600519", today, 118.0)
 
-        with patch.object(PortfolioService, "_fetch_realtime_position_price", return_value=(125.0, "unit-test")):
+        with patch.object(PortfolioService, "_fetch_realtime_position_price", return_value={"price": 125.0, "provider": "unit-test", "kind": "realtime", "provider_time": None, "fetched_at": None}):
             snapshot = self.service.get_portfolio_snapshot(account_id=aid, as_of=today, cost_method="fifo")
 
         pos = snapshot["accounts"][0]["positions"][0]
@@ -190,7 +193,10 @@ class PortfolioServiceTestCase(unittest.TestCase):
         self.assertAlmostEqual(pos["unrealized_pnl_base"], 250.0, places=6)
         self.assertEqual(pos["price_source"], "realtime_quote")
         self.assertEqual(pos["price_provider"], "unit-test")
-        self.assertEqual(pos["price_date"], today.isoformat())
+        # R3: 该 mock 未披露 provider_time → price_date 未知（None），
+        # time_quality=unknown，不填获取日期。
+        self.assertIsNone(pos["price_date"])
+        self.assertEqual(pos["price_time_quality"], "unknown")
         self.assertFalse(pos["price_stale"])
         self.assertTrue(pos["price_available"])
 
@@ -213,7 +219,7 @@ class PortfolioServiceTestCase(unittest.TestCase):
         with patch.object(
             PortfolioService,
             "_fetch_realtime_position_price",
-            return_value=(None, None),
+            return_value=None,
         ):
             snapshot = self.service.get_portfolio_snapshot(account_id=aid, as_of=today, cost_method="fifo")
 
@@ -617,7 +623,7 @@ class PortfolioServiceTestCase(unittest.TestCase):
     def test_build_positions_handles_zero_cost_without_division(self) -> None:
         account = SimpleNamespace(base_currency="CNY")
 
-        positions, _, _, _, _ = self.service._build_positions(
+        positions, _, _, _, _, _ = self.service._build_positions(
             account=account,
             as_of_date=date(2026, 1, 3),
             cost_method="avg",

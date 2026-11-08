@@ -174,11 +174,17 @@ class TestStorage(unittest.TestCase):
 
         db._ensure_schema_migration_record()
         db._ensure_schema_migration_record()
+        db._ensure_portfolio_trade_event_type()
+        db._ensure_portfolio_trade_event_type()
 
         with db.get_session() as session:
             versions = session.execute(select(DatabaseSchemaMigration.version)).scalars().all()
 
-        self.assertEqual(sorted(versions), sorted([CURRENT_SCHEMA_VERSION, CHAT_STATE_SCHEMA_VERSION]))
+        self.assertEqual(sorted(versions), sorted([
+            CURRENT_SCHEMA_VERSION,
+            CHAT_STATE_SCHEMA_VERSION,
+            DatabaseManager._PORTFOLIO_INIT_BACKFILL_VERSION,
+        ]))
 
         DatabaseManager.reset_instance()
 

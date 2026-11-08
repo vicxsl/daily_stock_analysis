@@ -330,6 +330,9 @@ class AlertService:
                 data_source="realtime_quote",
             )
 
+        guard = self._freshness_guard(rule, quote, threshold)
+        if guard is not None:
+            return guard
         try:
             current_price = float(getattr(quote, "price", 0) or 0)
         except (TypeError, ValueError) as exc:
@@ -394,6 +397,9 @@ class AlertService:
                 data_source="realtime_quote",
             )
 
+        guard = self._freshness_guard(rule, quote, threshold)
+        if guard is not None:
+            return guard
         current_change_pct = _read_quote_float(
             quote,
             "change_pct",
@@ -717,6 +723,19 @@ class AlertService:
         if isinstance(rule, MarketLightAlert):
             return MARKET_LIGHT_DATA_SOURCE
         return None
+
+    def _freshness_guard(self, rule: Any, quote: Any, threshold: float) -> Optional[Dict[str, Any]]:
+        from src.services.portfolio_service import PortfolioService, _CN_TZ
+        stamp = self._extract_quote_datetime(quote)
+        now = datetime.now(_CN_TZ)
+        if stamp is not None:
+            info = PortfolioService.__new__(PortfolioService)._build_realtime_resolved_price(
+                symbol=rule.stock_code, as_of_date=now.date(), now_cn=now,
+                quote_info={"price":1.0,"provider":"time_validation_only","kind":"realtime","provider_time":stamp.isoformat(),"fetched_at":now.isoformat()})
+            if info.time_quality != "unknown" and not info.is_stale:
+                return None
+        return self._not_triggered(rule, None, "Quote source time unknown or stale; price trigger paused",
+            record_status="degraded", threshold=threshold, data_source="realtime_quote", data_timestamp=stamp)
 
     @classmethod
     def _extract_quote_datetime(cls, quote: Any) -> Optional[datetime]:

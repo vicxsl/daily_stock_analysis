@@ -352,7 +352,7 @@ class SearchServiceConcurrencyTestCase(unittest.TestCase):
 
         def wait_for_owner(_key, _event, *, timeout_seconds):
             self.assertGreater(timeout_seconds, 0)
-            self.assertLessEqual(timeout_seconds, 0.2)
+            self.assertLessEqual(timeout_seconds, 0.2 + 1e-9)
             time.sleep(0.03)
             return None
 

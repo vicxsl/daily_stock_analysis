@@ -462,3 +462,29 @@ def get_realtime_circuit_breaker() -> CircuitBreaker:
 def get_chip_circuit_breaker() -> CircuitBreaker:
     """获取筹码接口熔断器"""
     return _chip_circuit_breaker
+
+
+# R4/F09: 上游同源披露。akshare 的 ETF 行情/基金净值与 efinance 的 ETF 行情
+# 实际都打东方财富公开接口——它们不是独立双源。故障分析与报告披露按上游
+# 组归并；两个"来源"同时失败属于同一上游故障，不得称独立双源验证。
+SOURCE_UPSTREAM_GROUPS = {
+    "akshare_etf": "eastmoney",
+    "efinance_etf": "eastmoney",
+    "akshare_fund_nav": "eastmoney",
+    "eastmoney": "eastmoney",
+    "em": "eastmoney",
+    "tencent": "tencent",
+    "qq": "tencent",
+    "sina": "sina",
+}
+
+
+def upstream_group_for(provider) -> Optional[str]:
+    """Map one provider/source name to its shared upstream group (None = unknown)."""
+    if not provider:
+        return None
+    key = str(provider).strip().lower()
+    for name, group in SOURCE_UPSTREAM_GROUPS.items():
+        if key == name or key.startswith(name + "_") or key.startswith(name + "."):
+            return group
+    return None

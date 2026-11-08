@@ -30,7 +30,7 @@ import random
 import threading
 import time
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from typing import Optional, Dict, Any, List, Tuple
 
 import pandas as pd
@@ -207,6 +207,40 @@ def _parse_tencent_amount(fields: List[str]) -> Optional[float]:
 
     amount_wan = safe_float(fields[37]) if len(fields) > 37 and fields[37] else None
     return amount_wan * 10000 if amount_wan is not None else None
+
+
+def _parse_tencent_provider_time(
+    fields: List[str], now_cn: Optional[datetime] = None
+) -> Optional[str]:
+    """
+    解析腾讯实时行情 fields[30] 的源报价时间（北京时间）为 ISO 8601。
+
+    腾讯返回内容对字段 30 的公开说明为 yyyyMMddHHmmss；同时兼容
+    "yyyy-MM-dd HH:MM:SS" 变体。缺失、格式错误或明显未来时间（容忍
+    5 分钟时钟偏差）返回 None —— 宁可 unknown 也不用抓取时间冒充源
+    时间（T1 价格时间语义）。返回值交给 _enrich_realtime_quote 与
+    组合估值的 60 分钟/交易时段策略使用。
+    """
+    raw = fields[30].strip() if len(fields) > 30 and fields[30] else ""
+    if not raw:
+        return None
+
+    parsed: Optional[datetime]
+    digits = "".join(ch for ch in raw if ch.isdigit())
+    try:
+        if len(digits) == 14:
+            parsed = datetime.strptime(digits, "%Y%m%d%H%M%S")
+        else:
+            parsed = datetime.strptime(raw.replace("/", "-"), "%Y-%m-%d %H:%M:%S")
+    except ValueError:
+        return None
+
+    cn_tz = timezone(timedelta(hours=8))
+    parsed = parsed.replace(tzinfo=cn_tz)
+    now = now_cn or datetime.now(cn_tz)
+    if parsed > now + timedelta(minutes=5):
+        return None
+    return parsed.isoformat()
 
 
 def is_hk_stock_code(stock_code: str) -> bool:
@@ -1095,6 +1129,8 @@ class AkshareFetcher(BaseFetcher):
             return None
         elif _is_hk_code(stock_code):
             return self._get_hk_realtime_quote(stock_code)
+        elif _is_etf_code(stock_code) and source == "tencent":
+            return self._get_stock_realtime_quote_tencent(stock_code)
         elif _is_etf_code(stock_code):
             source_key = "akshare_etf"
             if not circuit_breaker.is_available(source_key):
@@ -1493,6 +1529,7 @@ class AkshareFetcher(BaseFetcher):
                 pb_ratio=safe_float(fields[46]) if len(fields) > 46 else None,  # 市净率
                 circ_mv=safe_float(fields[44]) * 100000000 if len(fields) > 44 and fields[44] else None,  # 流通市值(亿->元)
                 total_mv=safe_float(fields[45]) * 100000000 if len(fields) > 45 and fields[45] else None,  # 总市值(亿->元)
+                provider_timestamp=_parse_tencent_provider_time(fields),
             )
             
             logger.info(

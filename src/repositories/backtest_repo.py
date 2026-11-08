@@ -6,12 +6,14 @@ Provides database access helpers for backtest tables.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
+import os
 from datetime import date, datetime, timedelta
-from typing import List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
-from sqlalchemy import and_, case, delete, desc, func, or_, select
+from sqlalchemy import and_, case, delete, desc, func, or_, select, update
 
 from src.core.backtest_engine import OVERALL_SENTINEL_CODE
 from src.services.stock_code_utils import resolve_daily_stock_identity
@@ -21,6 +23,38 @@ from src.storage import BacktestResult, BacktestSummary, DatabaseManager, Analys
 logger = logging.getLogger(__name__)
 
 MARKET_REVIEW_REPORT_TYPE = "market_review"
+RETRYABLE_INCOMPLETE_STATUSES = ("insufficient_data", "error")
+# Columns that constitute the substantive content of one evaluation row.
+# ``evaluated_at`` alone never counts as a content change.
+RESULT_CONTENT_COLUMNS = (
+    "analysis_history_id",
+    "code",
+    "analysis_date",
+    "eval_window_days",
+    "engine_version",
+    "eval_status",
+    "operation_advice",
+    "position_recommendation",
+    "start_price",
+    "end_close",
+    "max_high",
+    "min_low",
+    "stock_return_pct",
+    "direction_expected",
+    "direction_correct",
+    "outcome",
+    "stop_loss",
+    "take_profit",
+    "hit_stop_loss",
+    "hit_take_profit",
+    "first_hit",
+    "first_hit_date",
+    "first_hit_trading_days",
+    "simulated_entry_price",
+    "simulated_exit_price",
+    "simulated_exit_reason",
+    "simulated_return_pct",
+)
 BacktestResultContextRow = Tuple[
     BacktestResult,
     Optional[str],
@@ -31,6 +65,77 @@ BacktestResultContextRow = Tuple[
     Optional[str],
     Optional[int],
 ]
+
+
+def _result_content_map(result: BacktestResult) -> Dict[str, Any]:
+    """Canonical content of one evaluation row, ignoring evaluated_at."""
+
+    content: Dict[str, Any] = {}
+    for column in RESULT_CONTENT_COLUMNS:
+        value = getattr(result, column, None)
+        if isinstance(value, datetime):
+            value = value.isoformat()
+        elif isinstance(value, date):
+            value = value.isoformat()
+        content[column] = value
+    return content
+
+
+def _result_content_hash(content: Dict[str, Any]) -> str:
+    payload = json.dumps(content, ensure_ascii=False, sort_keys=True, default=str)
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _write_result_snapshot(
+    existing: BacktestResult,
+    *,
+    revision_root: str,
+    reason: str,
+) -> Optional[str]:
+    """Persist an immutable pre-update snapshot of ``existing``.
+
+    Returns the snapshot path, or None when identical content was already
+    snapshotted. Raises on write/verify failure so the caller can skip the
+    DB update (snapshot first, update second, never the other way round).
+    """
+
+    content = _result_content_map(existing)
+    content_hash = _result_content_hash(content)
+    directory = os.path.join(
+        revision_root,
+        f"{existing.analysis_history_id}-{existing.eval_window_days}-{existing.engine_version}",
+    )
+    os.makedirs(directory, exist_ok=True)
+    payload = {
+        "snapshot_version": 1,
+        "reason": reason,
+        "saved_at": datetime.now().isoformat(),
+        "key": {
+            "id": existing.id,
+            "analysis_history_id": existing.analysis_history_id,
+            "eval_window_days": existing.eval_window_days,
+            "engine_version": existing.engine_version,
+        },
+        "snapshot_hash": content_hash,
+        "evaluated_at": existing.evaluated_at.isoformat() if existing.evaluated_at else None,
+        "original": content,
+    }
+    path = os.path.join(directory, f"{content_hash}.json")
+    if os.path.exists(path):
+        with open(path, "r", encoding="utf-8") as handle:
+            previous = json.load(handle)
+        if isinstance(previous, dict) and previous.get("snapshot_hash") == content_hash:
+            return path
+
+    tmp_path = f"{path}.tmp-{os.getpid()}"
+    with open(tmp_path, "w", encoding="utf-8") as handle:
+        json.dump(payload, handle, ensure_ascii=False, indent=2, default=str)
+    os.replace(tmp_path, path)
+    with open(path, "r", encoding="utf-8") as handle:
+        verify = json.load(handle)
+    if not isinstance(verify, dict) or verify.get("snapshot_hash") != content_hash:
+        raise RuntimeError(f"backtest result snapshot verify failed: {path}")
+    return path
 
 
 class BacktestRepository:
@@ -49,8 +154,17 @@ class BacktestRepository:
         eval_window_days: int,
         engine_version: str,
         force: bool,
+        retry_incomplete: bool = False,
     ) -> List[AnalysisHistory]:
-        """Return AnalysisHistory rows eligible for backtest."""
+        """Return AnalysisHistory rows eligible for backtest.
+
+        ``force=False`` (default) keeps the manual semantics: rows that already
+        have any result for the same (window, engine) are excluded.
+        ``retry_incomplete=True`` additionally re-selects rows whose stored
+        result is ``insufficient_data``/``error`` so the automatic post-analysis
+        evaluation can complete them on their original key. Completed rows are
+        never re-selected by this flag.
+        """
         cutoff_dt = datetime.now() - timedelta(days=min_age_days)
 
         with self.db.get_session() as session:
@@ -64,18 +178,56 @@ class BacktestRepository:
                 )
             )
 
-            query = select(AnalysisHistory).where(and_(*conditions))
-
-            if not force:
+            if force:
+                pass
+            elif retry_incomplete:
+                retryable = (
+                    select(BacktestResult.analysis_history_id)
+                    .where(
+                        and_(
+                            BacktestResult.eval_window_days == eval_window_days,
+                            BacktestResult.engine_version == engine_version,
+                            BacktestResult.eval_status.in_(RETRYABLE_INCOMPLETE_STATUSES),
+                        )
+                    )
+                    .subquery()
+                )
+                any_result = (
+                    select(BacktestResult.analysis_history_id)
+                    .where(
+                        and_(
+                            BacktestResult.eval_window_days == eval_window_days,
+                            BacktestResult.engine_version == engine_version,
+                        )
+                    )
+                    .subquery()
+                )
+                conditions.append(
+                    or_(
+                        AnalysisHistory.id.not_in(any_result),
+                        AnalysisHistory.id.in_(retryable),
+                    )
+                )
+            else:
                 existing_ids = select(BacktestResult.analysis_history_id).where(
                     and_(
                         BacktestResult.eval_window_days == eval_window_days,
                         BacktestResult.engine_version == engine_version,
                     )
                 )
+                query = select(AnalysisHistory).where(and_(*conditions))
                 query = query.where(AnalysisHistory.id.not_in(existing_ids))
+                query = query.order_by(desc(AnalysisHistory.created_at)).offset(offset).limit(limit)
+                rows = session.execute(query).scalars().all()
+                return list(rows)
 
-            query = query.order_by(desc(AnalysisHistory.created_at)).offset(offset).limit(limit)
+            query = select(AnalysisHistory).where(and_(*conditions))
+            if retry_incomplete and not force:
+                # Deterministic pagination for the auto retry path.
+                query = query.order_by(desc(AnalysisHistory.created_at), desc(AnalysisHistory.id))
+            else:
+                query = query.order_by(desc(AnalysisHistory.created_at))
+            query = query.offset(offset).limit(limit)
             rows = session.execute(query).scalars().all()
             return list(rows)
 
@@ -171,6 +323,128 @@ class BacktestRepository:
                 session.rollback()
                 logger.error(f"批量保存回测结果失败: {exc}")
                 raise
+
+    def save_results_idempotent(
+        self,
+        results: List[BacktestResult],
+        *,
+        revision_root: str,
+        reason: str = "auto_retry_incomplete_update",
+    ) -> Dict[str, int]:
+        """Per-row transactional upsert that preserves the original row id.
+
+        Contract for the automatic incomplete-retry path:
+        - no current row -> INSERT (``inserted``);
+        - current row is ``completed`` -> skip without writes (``skipped_completed``);
+        - same canonical content (``evaluated_at`` excluded) -> no write (``unchanged``);
+        - substantive change -> immutable pre-update snapshot first, then a
+          conditional UPDATE on the original id whose WHERE excludes ``completed``
+          (``updated``; a concurrently completed row yields ``skipped_completed``).
+
+        Snapshot write failure aborts that row's update (row stays intact, the
+        error is counted); DB failure keeps any already-written snapshot on disk
+        (unapplied snapshots are harmless: content-hash keyed and immutable).
+        """
+        counters = {
+            "inserted": 0,
+            "updated": 0,
+            "unchanged": 0,
+            "skipped_completed": 0,
+            "saved": 0,
+            "errors": 0,
+        }
+        if not results:
+            return counters
+
+        for result in results:
+            try:
+                outcome = self._save_result_idempotent_one(result, revision_root=revision_root, reason=reason)
+                if outcome == "inserted":
+                    counters["inserted"] += 1
+                    counters["saved"] += 1
+                elif outcome == "updated":
+                    counters["updated"] += 1
+                    counters["saved"] += 1
+                elif outcome == "unchanged":
+                    counters["unchanged"] += 1
+                elif outcome == "skipped_completed":
+                    counters["skipped_completed"] += 1
+            except Exception as exc:
+                counters["errors"] += 1
+                logger.error(
+                    "幂等保存回测结果失败 analysis=%s window=%s engine=%s: %s",
+                    result.analysis_history_id,
+                    result.eval_window_days,
+                    result.engine_version,
+                    exc,
+                )
+        return counters
+
+    def _save_result_idempotent_one(
+        self,
+        result: BacktestResult,
+        *,
+        revision_root: str,
+        reason: str,
+    ) -> str:
+        new_content = _result_content_map(result)
+        with self.db.get_session() as session:
+            existing = session.execute(
+                select(BacktestResult).where(
+                    and_(
+                        BacktestResult.analysis_history_id == result.analysis_history_id,
+                        BacktestResult.eval_window_days == result.eval_window_days,
+                        BacktestResult.engine_version == result.engine_version,
+                    )
+                ).limit(1)
+            ).scalar_one_or_none()
+
+            if existing is None:
+                try:
+                    session.add(result)
+                    session.commit()
+                    return "inserted"
+                except Exception:
+                    session.rollback()
+                    # A concurrent writer may have inserted this key first;
+                    # re-read and classify against the row that now exists.
+                    existing = session.execute(
+                        select(BacktestResult).where(
+                            and_(
+                                BacktestResult.analysis_history_id == result.analysis_history_id,
+                                BacktestResult.eval_window_days == result.eval_window_days,
+                                BacktestResult.engine_version == result.engine_version,
+                            )
+                        ).limit(1)
+                    ).scalar_one_or_none()
+                    if existing is None:
+                        raise
+
+            if existing.eval_status == "completed":
+                return "skipped_completed"
+
+            if _result_content_map(existing) == new_content:
+                return "unchanged"
+
+            _write_result_snapshot(existing, revision_root=revision_root, reason=reason)
+
+            values = {column: getattr(result, column, None) for column in RESULT_CONTENT_COLUMNS}
+            values["evaluated_at"] = result.evaluated_at or datetime.now()
+            outcome = session.execute(
+                update(BacktestResult)
+                .where(
+                    and_(
+                        BacktestResult.id == existing.id,
+                        BacktestResult.eval_status != "completed",
+                    )
+                )
+                .values(**values)
+            )
+            if outcome.rowcount:
+                session.commit()
+                return "updated"
+            session.rollback()
+            return "skipped_completed"
 
     def get_results_paginated(
         self,

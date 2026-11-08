@@ -1112,6 +1112,8 @@ const StockScreeningPage: React.FC = () => {
       }
       if (nextHotspots.length === 0) {
         setHotspotError(formatHotspotEmptyMessage(result));
+      } else if ((result.sourceErrors || []).length > 0) {
+        setHotspotError('部分热点数据源暂不可用，结果可能不完整。');
       }
     } catch (err) {
       setHotspotError(toApiErrorMessage(err, '热点题材加载失败，请稍后重试。'));

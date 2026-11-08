@@ -290,6 +290,52 @@ class PortfolioRepository:
         ).scalar_one_or_none()
         return row is not None
 
+    def find_trade_by_uid(self, account_id: int, trade_uid: str) -> Optional[PortfolioTrade]:
+        """Return the trade row carrying this account-scoped uid, if any."""
+        uid = (trade_uid or "").strip()
+        if not uid:
+            return None
+        with self.db.get_session() as session:
+            return self.find_trade_by_uid_in_session(
+                session=session, account_id=account_id, trade_uid=uid
+            )
+
+    def find_trade_by_uid_in_session(
+        self, *, session: Any, account_id: int, trade_uid: str
+    ) -> Optional[PortfolioTrade]:
+        row = session.execute(
+            select(PortfolioTrade).where(
+                and_(
+                    PortfolioTrade.account_id == account_id,
+                    PortfolioTrade.trade_uid == trade_uid,
+                )
+            ).limit(1)
+        ).scalar_one_or_none()
+        return row
+
+    def find_cash_ledger_by_note(
+        self, account_id: int, note: str, *, session: Optional[Any] = None
+    ) -> Optional[PortfolioCashLedger]:
+        """Return the first cash ledger row whose note exactly matches."""
+        text_value = (note or "").strip()
+        if not text_value:
+            return None
+
+        def query(target_session: Any) -> Optional[PortfolioCashLedger]:
+            return target_session.execute(
+                select(PortfolioCashLedger).where(
+                    and_(
+                        PortfolioCashLedger.account_id == account_id,
+                        PortfolioCashLedger.note == text_value,
+                    )
+                ).order_by(PortfolioCashLedger.id.asc()).limit(1)
+            ).scalar_one_or_none()
+
+        if session is not None:
+            return query(session)
+        with self.db.get_session() as own_session:
+            return query(own_session)
+
     def has_trade_dedup_hash_in_session(self, *, session: Any, account_id: int, dedup_hash: str) -> bool:
         row = session.execute(
             select(PortfolioTrade.id).where(
@@ -318,6 +364,7 @@ class PortfolioRepository:
         tax: float,
         note: Optional[str] = None,
         dedup_hash: Optional[str] = None,
+        event_type: str = "trade",
     ) -> PortfolioTrade:
         row = PortfolioTrade(
             account_id=account_id,
@@ -333,6 +380,7 @@ class PortfolioRepository:
             tax=tax,
             note=note,
             dedup_hash=dedup_hash,
+            event_type=event_type,
         )
         session.add(row)
         self._invalidate_account_cache_in_session(
@@ -576,6 +624,7 @@ class PortfolioRepository:
         side: Optional[str],
         page: int,
         page_size: int,
+        event_type: Optional[str] = None,
     ) -> Tuple[List[PortfolioTrade], int]:
         with self.db.get_session() as session:
             conditions = []
@@ -589,6 +638,8 @@ class PortfolioRepository:
                 conditions.append(PortfolioTrade.symbol.in_(symbols))
             if side:
                 conditions.append(PortfolioTrade.side == side)
+            if event_type:
+                conditions.append(PortfolioTrade.event_type == event_type)
 
             data_query = select(PortfolioTrade).join(
                 PortfolioAccount,

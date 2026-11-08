@@ -3,6 +3,8 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
 import logging
 import multiprocessing
 import os
@@ -22,6 +24,9 @@ from src.scheduler import Scheduler, normalize_schedule_times
 
 logger = logging.getLogger(__name__)
 CLI_SCHEDULER_OWNER_ENV = "DSA_CLI_SCHEDULER_OWNS_SCHEDULE"
+AUTO_BACKTEST_STATUS_FILENAME = "auto-backtest-status.json"
+AUTO_BACKTEST_STATUS_SCHEMA_VERSION = 1
+AUTO_BACKTEST_REVISIONS_DIRNAME = "backtest-revisions"
 RUNTIME_SCHEDULER_FORCE_ENABLED_ENV = "DSA_RUNTIME_SCHEDULER_FORCE_ENABLED"
 RUNTIME_SCHEDULER_RUN_IMMEDIATELY_ENV = "DSA_RUNTIME_SCHEDULER_RUN_IMMEDIATELY"
 RUNTIME_SCHEDULER_SUPPRESS_START_ENV = "DSA_RUNTIME_SCHEDULER_SUPPRESS_START"
@@ -59,6 +64,115 @@ def run_with_global_analysis_lock(
     return True
 
 
+def _runtime_data_dir() -> str:
+    """Directory holding the runtime DB (same resolution as DatabaseManager)."""
+    db_path = os.getenv("DATABASE_PATH", "./data/stock_analysis.db")
+    return os.path.dirname(os.path.abspath(db_path)) or os.path.abspath(db_path)
+
+
+def auto_backtest_status_path() -> str:
+    return os.path.join(_runtime_data_dir(), AUTO_BACKTEST_STATUS_FILENAME)
+
+
+def auto_backtest_revision_root() -> str:
+    return os.path.join(_runtime_data_dir(), AUTO_BACKTEST_REVISIONS_DIRNAME)
+
+
+def read_auto_backtest_status() -> Dict[str, Any]:
+    """Read the persisted auto-backtest stage status; unknown when unavailable."""
+    try:
+        with open(auto_backtest_status_path(), "r", encoding="utf-8") as handle:
+            payload = json.load(handle)
+    except FileNotFoundError:
+        return {"status": "unknown"}
+    except (OSError, ValueError) as exc:
+        logger.warning("读取自动回测状态失败(%s): %s", auto_backtest_status_path(), exc)
+        return {"status": "unknown"}
+    if not isinstance(payload, dict) or not str(payload.get("status") or "").strip():
+        return {"status": "unknown"}
+    return payload
+
+
+def write_auto_backtest_status(payload: Dict[str, Any]) -> bool:
+    """Atomically persist the auto-backtest stage status; never raises."""
+    path = auto_backtest_status_path()
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        tmp_path = f"{path}.tmp-{os.getpid()}"
+        with open(tmp_path, "w", encoding="utf-8") as handle:
+            json.dump(payload, handle, ensure_ascii=False, indent=2)
+        os.replace(tmp_path, path)
+        return True
+    except (OSError, ValueError, TypeError) as exc:
+        logger.warning("写入自动回测状态失败(%s): %s", path, exc)
+        try:
+            if os.path.exists(tmp_path):
+                os.remove(tmp_path)
+        except (OSError, UnboundLocalError):
+            pass
+        return False
+
+
+def build_auto_backtest_status(
+    *,
+    run_id: str,
+    status: str,
+    started_at: Optional[str],
+    finished_at: Optional[str] = None,
+    stats: Optional[Dict[str, Any]] = None,
+    error: Optional[str] = None,
+    carry_last_success: bool = True,
+) -> Dict[str, Any]:
+    """Build one status payload, optionally carrying the last success time."""
+    payload: Dict[str, Any] = {
+        "schema_version": AUTO_BACKTEST_STATUS_SCHEMA_VERSION,
+        "run_id": run_id,
+        "status": status,
+        "started_at": started_at,
+        "finished_at": finished_at,
+        "stats": stats,
+        "error": error,
+    }
+    if carry_last_success:
+        previous = read_auto_backtest_status()
+        last_success = previous.get("last_success_at")
+        if status == "completed":
+            payload["last_success_at"] = finished_at or datetime.now().isoformat()
+        elif last_success:
+            payload["last_success_at"] = last_success
+    elif status == "completed":
+        payload["last_success_at"] = finished_at or datetime.now().isoformat()
+    return payload
+
+
+def _exit_scheduled_analysis_worker(result_queue: Any, lingering_threads: List[Dict[str, Any]]) -> None:
+    """Flush the receipt and finish this single-purpose worker deterministically.
+
+    The analysis stack leaves third-party non-daemon threads behind (litellm
+    completion executor workers confirmed in production 2026-10-10). Normal
+    interpreter teardown can stall on them past the parent's join window even
+    though the analysis already finished and the receipt was delivered. Flush
+    the queue feeder so the receipt is durable, report what lingers, then exit
+    without letting those threads veto the exit of a finished worker.
+    """
+    if lingering_threads:
+        logger.warning(
+            "[RuntimeScheduler] analysis worker exits with %d lingering non-daemon thread(s): %s",
+            len(lingering_threads),
+            sorted({str(item.get("name")) for item in lingering_threads}),
+        )
+    try:
+        logging.shutdown()
+    except Exception:  # noqa: BLE001 - best-effort flush before hard exit
+        pass
+    try:
+        result_queue.close()
+        result_queue.join_thread()
+    except Exception:  # noqa: BLE001 - queue already closed or feeder gone
+        pass
+    os._exit(0)
+
+
 def _run_scheduled_analysis_process(
     result_queue: Any,
     stock_codes: Optional[List[str]],
@@ -81,10 +195,20 @@ def _run_scheduled_analysis_process(
         stock_codes,
         scheduled_for=datetime.fromisoformat(scheduled_for) if scheduled_for else None,
     )
-    result_queue.put({
-        "success": success, "error": service._last_error,
-        "skipped": service._last_skip_reason,
-    })
+    lingering_threads = [
+        {"name": thread.name, "daemon": bool(thread.daemon)}
+        for thread in threading.enumerate()
+        if thread is not threading.current_thread() and not thread.daemon
+    ]
+    result_queue.put(
+        {
+            "success": success,
+            "error": service._last_error,
+            "lingering_threads": lingering_threads,
+            "skipped": service._last_skip_reason,
+        }
+    )
+    _exit_scheduled_analysis_worker(result_queue, lingering_threads)
 
 
 def _posix_descendant_process_ids(root_pid: int) -> Set[int]:
@@ -583,6 +707,18 @@ class RuntimeSchedulerService:
                     self._last_error = None
                 else:
                     self._last_error = result.get("error") or "runtime scheduled analysis failed"
+            lingering_names = [
+                str(item.get("name"))
+                for item in (result.get("lingering_threads") or [])
+                if isinstance(item, dict)
+            ]
+            if lingering_names:
+                logger.info(
+                    "[RuntimeScheduler] analysis worker reported %d lingering non-daemon "
+                    "thread(s) at exit: %s",
+                    len(lingering_names),
+                    sorted(set(lingering_names)),
+                )
         except Exception as exc:  # noqa: BLE001 - watchdog failures must release the scheduler.
             with self._analysis_process_lock:
                 if generation == self._analysis_generation:
@@ -832,4 +968,5 @@ class RuntimeSchedulerService:
             "last_error": self._last_error,
             "last_skipped_at": self._last_skipped_at,
             "last_skip_reason": self._last_skip_reason,
+            "last_backtest": read_auto_backtest_status(),
         }

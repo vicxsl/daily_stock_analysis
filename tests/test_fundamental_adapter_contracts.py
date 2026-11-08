@@ -130,12 +130,12 @@ def test_capital_flow_real_akshare_request_uses_shenzhen_security(monkeypatch):
 
     def get(url, params, **kwargs):
         calls.append(params["secid"])
-        return SimpleNamespace(json=lambda: {"data": {"klines": [
+        return SimpleNamespace(status_code=200, json=lambda: {"data": {"klines": [
             "2026-09-28,10,0,0,0,0,1,0,0,0,0,12,0,0,0",
             "2026-09-30,-20,0,0,0,0,-2,0,0,0,0,12,0,0,0",
         ]}})
 
-    monkeypatch.setattr(requests, "get", get)
+    monkeypatch.setattr(requests.sessions.Session, "request", lambda _session, method, url, **kwargs: get(url, **kwargs))
     monkeypatch.setattr(ak, "stock_sector_fund_flow_rank", lambda: pd.DataFrame())
     result = AkshareFundamentalAdapter().get_capital_flow("000001")
     assert calls == ["0.000001"]
@@ -167,11 +167,11 @@ def test_capital_flow_real_akshare_missing_sector_amounts_reach_manager_and_agen
                 "f204": "股票A", "f205": "600519", "f206": 1,
             }
             data = {"total": 1, "diff": [row]}
-        return SimpleNamespace(json=lambda: {"data": data})
+        return SimpleNamespace(status_code=200, json=lambda: {"data": data})
 
     # Keep both AkShare implementations and the adapter/manager execution real;
     # replace only their HTTP boundary and runtime configuration.
-    monkeypatch.setattr(requests, "get", get)
+    monkeypatch.setattr(requests.sessions.Session, "request", lambda _session, method, url, **kwargs: get(url, **kwargs))
     sector_df = ak.stock_sector_fund_flow_rank()
     assert sector_df["今日主力净流入-净额"].isna().all()
     calls.clear()
@@ -300,7 +300,10 @@ def test_installed_akshare_receives_valid_parameters_at_http_boundary(monkeypatc
         calls.append((url, dict(kwargs.get("params", {}))))
         raise RuntimeError("offline transport boundary")
 
-    monkeypatch.setattr(requests, "get", stop_at_http)
+    monkeypatch.setattr(
+        requests.sessions.Session, "request",
+        lambda _session, method, url, **kwargs: stop_at_http(url, **kwargs),
+    )
     for name in (
         "stock_financial_abstract", "stock_financial_analysis_indicator",
         "stock_fhps_detail_em", "stock_history_dividend_detail", "stock_dividend_cninfo",

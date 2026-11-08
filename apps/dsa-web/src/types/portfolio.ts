@@ -65,11 +65,11 @@ export interface PortfolioAccountSnapshot {
   baseCurrency: string;
   asOf: string;
   costMethod: PortfolioCostMethod;
-  totalCash: number;
+  totalCash: number | null;
   totalMarketValue: number;
   /** Account market value converted into the parent snapshot currency. */
   totalMarketValueAggregate?: number | null;
-  totalEquity: number;
+  totalEquity: number | null;
   realizedPnl: number;
   unrealizedPnl: number;
   feeTotal: number;
@@ -85,9 +85,9 @@ export interface PortfolioSnapshotResponse {
   costMethod: PortfolioCostMethod;
   currency: string;
   accountCount: number;
-  totalCash: number;
+  totalCash: number | null;
   totalMarketValue: number;
-  totalEquity: number;
+  totalEquity: number | null;
   realizedPnl: number;
   unrealizedPnl: number;
   feeTotal: number;

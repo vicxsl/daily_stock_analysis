@@ -29,7 +29,7 @@ RUN ln -snf /usr/share/zoneinfo/$TZ /etc/localtime && echo $TZ > /etc/timezone
 
 # 安装系统依赖（wkhtmltopdf 含 wkhtmltoimage，用于 Markdown 转图片 Issue #289）
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    gcc \
+    gcc procps \
     curl \
     gosu \
     wkhtmltopdf \

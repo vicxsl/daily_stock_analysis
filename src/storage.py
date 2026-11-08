@@ -557,6 +557,11 @@ class PortfolioTrade(Base):
     currency = Column(String(8), nullable=False, default='CNY')
     trade_date = Column(Date, nullable=False, index=True)
     side = Column(String(8), nullable=False)  # buy/sell
+    # Event provenance: 'trade' = real executed trade (moves cash);
+    # 'baseline' = confirmed account baseline position (no cash movement);
+    # 'init' = legacy screenshot-initialization record, kept verbatim but
+    # excluded from real-trade statistics.
+    event_type = Column(String(16), nullable=False, default='trade')
     quantity = Column(Float, nullable=False)
     price = Column(Float, nullable=False)
     fee = Column(Float, default=0.0)
@@ -611,6 +616,33 @@ class PortfolioCorporateAction(Base):
     __table_args__ = (
         Index('ix_portfolio_ca_account_date', 'account_id', 'effective_date'),
     )
+
+
+class PortfolioInstrumentIdentity(Base):
+    """Confirmed instrument identities for valuation routing (R3/F06).
+
+    Valuation routing prefers a CONFIRMED identity over code-range heuristics:
+    otc_fund -> fund NAV, stock/etf/index -> exchange quote. Symbols whose
+    identity is unconfirmed AND ambiguous (stock/fund code collision, or the
+    OTC registry unavailable) have their valuation paused instead of guessing
+    by trying the other asset class. Alias symbols (600887 / 600887.SH /
+    SH600887) normalize to one bare-code row so every alias points at the same
+    instrument. This is instrument metadata, not an account fact.
+    """
+
+    __tablename__ = 'portfolio_instrument_identities'
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    symbol = Column(String(16), nullable=False, unique=True, index=True)
+    # stock | etf | index | otc_fund
+    kind = Column(String(16), nullable=False)
+    market = Column(String(8), nullable=False, default='cn')
+    currency = Column(String(8), nullable=False, default='CNY')
+    source = Column(String(32))        # baseline:<date> | manual | watchlist
+    confirmed_by = Column(String(64))
+    note = Column(String(255))
+    confirmed_at = Column(DateTime, default=datetime.now)
+    created_at = Column(DateTime, default=datetime.now, index=True)
 
 
 class PortfolioPosition(Base):
@@ -1403,6 +1435,7 @@ class DatabaseManager(metaclass=_DatabaseManagerMeta):
             Base.metadata.create_all(self._engine)
             self._ensure_llm_usage_telemetry_columns()
             self._ensure_decision_signal_profile_schema()
+            self._ensure_portfolio_trade_event_type()
             self._ensure_stock_daily_canonical_id()
             self._ensure_intelligence_item_scope_values()
             self._ensure_schema_migration_record()
@@ -1580,6 +1613,86 @@ class DatabaseManager(metaclass=_DatabaseManagerMeta):
 
         self._ensure_decision_signal_profile_indexes()
         self._backfill_decision_signal_profile_from_metadata()
+
+    _PORTFOLIO_INIT_BACKFILL_VERSION = "2026-10-09-portfolio-event-type-init-backfill"
+
+    def _ensure_portfolio_trade_event_type(self) -> None:
+        """Add PortfolioTrade.event_type and one-time retag of legacy init rows.
+
+        Schema part: plain additive ALTER (SQLite + non-SQLite safe via metadata).
+        Data part: exactly-once retag of legacy screenshot-initialization buys
+        (note markers) to event_type='init' so replay stops moving cash for them
+        and real-trade statistics exclude them. Original field values are never
+        modified; the marker row in DatabaseSchemaMigration prevents re-runs from
+        touching future trades that merely contain the marker words.
+        """
+
+        inspector = inspect(self._engine)
+        if not inspector.has_table(PortfolioTrade.__tablename__):
+            return
+
+        try:
+            existing = {
+                column["name"]
+                for column in inspector.get_columns(PortfolioTrade.__tablename__)
+            }
+        except Exception as exc:
+            logger.error(
+                "[Portfolio] failed to inspect event_type column; migration aborted: %s",
+                exc,
+            )
+            raise
+
+        if "event_type" not in existing:
+            if self._is_sqlite_engine:
+                try:
+                    with self._engine.begin() as connection:
+                        connection.exec_driver_sql(
+                            f"ALTER TABLE {PortfolioTrade.__tablename__} "
+                            "ADD COLUMN event_type VARCHAR(16) NOT NULL DEFAULT 'trade'"
+                        )
+                except OperationalError as exc:
+                    if not self._is_sqlite_duplicate_column_error(exc, "event_type"):
+                        raise
+            else:
+                # Non-SQLite engines get the column through metadata.create_all
+                # on next start; nothing else to do here.
+                return
+
+        with self._SessionLocal() as session:
+            marker = session.get(DatabaseSchemaMigration, self._PORTFOLIO_INIT_BACKFILL_VERSION)
+        if marker is not None:
+            return
+
+        try:
+            with self._engine.begin() as connection:
+                from sqlalchemy import text
+
+                connection.execute(
+                    text(
+                        f"UPDATE {PortfolioTrade.__tablename__} SET event_type = 'init' "
+                        "WHERE event_type = 'trade' AND side = 'buy' AND ("
+                        "note LIKE '%初始化%' OR note LIKE '%截图%' OR note LIKE '%基线%')"
+                    )
+                )
+            session = self._SessionLocal()
+            try:
+                session.add(
+                    DatabaseSchemaMigration(
+                        version=self._PORTFOLIO_INIT_BACKFILL_VERSION,
+                        description=(
+                            "Retag legacy screenshot-initialization portfolio trades as "
+                            "event_type='init' (values preserved; cash replay and real-trade "
+                            "statistics exclude them per D12)"
+                        ),
+                    )
+                )
+                session.commit()
+            finally:
+                session.close()
+        except Exception:
+            logger.exception("[Portfolio] event_type init backfill failed; will retry next start")
+            raise
 
     def _ensure_decision_signal_profile_indexes(self) -> None:
         """Create profile-aware indexes without dropping legacy indexes."""

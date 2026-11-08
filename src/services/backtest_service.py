@@ -50,12 +50,16 @@ class BacktestService:
         *,
         code: Optional[str] = None,
         force: bool = False,
+        retry_incomplete: bool = False,
         eval_window_days: Optional[int] = None,
         min_age_days: Optional[int] = None,
         analysis_date_from: Optional[date] = None,
         analysis_date_to: Optional[date] = None,
         limit: int = 200,
+        revision_root: Optional[str] = None,
     ) -> Dict[str, Any]:
+        if retry_incomplete and force:
+            raise ValueError("retry_incomplete cannot be combined with force")
         config = get_config()
 
         if analysis_date_from and analysis_date_to and analysis_date_from > analysis_date_to:
@@ -92,6 +96,7 @@ class BacktestService:
             eval_window_days=int(eval_window_days),
             engine_version=str(engine_version),
             force=force,
+            retry_incomplete=retry_incomplete,
             analysis_date_from=analysis_date_from,
             analysis_date_to=analysis_date_to,
         )
@@ -100,6 +105,8 @@ class BacktestService:
         completed = 0
         insufficient = 0
         errors = 0
+        waiting_window = 0
+        unsupported = 0
         touched_codes: set[str] = set()
 
         results_to_save: List[BacktestResult] = []
@@ -170,6 +177,10 @@ class BacktestService:
 
                 if daily_window is None:
                     insufficient += 1
+                    if daily_identity is None:
+                        unsupported += 1
+                    else:
+                        waiting_window += 1
                     results_to_save.append(
                         BacktestResult(
                             analysis_history_id=analysis.id,
@@ -197,6 +208,7 @@ class BacktestService:
                 status = evaluation.get("eval_status")
                 if status == "insufficient_data":
                     insufficient += 1
+                    waiting_window += 1
                 elif status == "completed":
                     completed += 1
                 else:
@@ -252,8 +264,18 @@ class BacktestService:
                 )
 
         saved = 0
+        save_report: Optional[Dict[str, int]] = None
         if results_to_save:
-            saved = self.repo.save_results_batch(results_to_save, replace_existing=force)
+            if retry_incomplete and not force:
+                from src.services.runtime_scheduler import auto_backtest_revision_root
+
+                save_report = self.repo.save_results_idempotent(
+                    results_to_save,
+                    revision_root=revision_root or auto_backtest_revision_root(),
+                )
+                saved = int(save_report.get("saved", 0))
+            else:
+                saved = self.repo.save_results_batch(results_to_save, replace_existing=force)
 
         if saved:
             self._recompute_summaries(
@@ -299,6 +321,13 @@ class BacktestService:
             has_matching_analysis=has_matching_analysis,
             aligned_existing_result_dates=aligned_existing_result_dates,
         )
+        if retry_incomplete:
+            diagnostics["retry_incomplete"] = True
+            diagnostics["waiting_window"] = waiting_window
+            diagnostics["unsupported"] = unsupported
+            if save_report is not None:
+                for key in ("inserted", "updated", "unchanged", "skipped_completed", "errors"):
+                    diagnostics[f"save_{key}"] = int(save_report.get(key, 0))
 
         return {
             "processed": processed,
@@ -320,6 +349,7 @@ class BacktestService:
         eval_window_days: int,
         engine_version: str,
         force: bool,
+        retry_incomplete: bool = False,
         analysis_date_from: Optional[date],
         analysis_date_to: Optional[date],
     ) -> List[Any]:
@@ -334,6 +364,7 @@ class BacktestService:
                 eval_window_days=eval_window_days,
                 engine_version=engine_version,
                 force=force,
+                retry_incomplete=retry_incomplete,
             )
 
         matched: List[Any] = []
@@ -349,6 +380,7 @@ class BacktestService:
                 eval_window_days=eval_window_days,
                 engine_version=engine_version,
                 force=force,
+                retry_incomplete=retry_incomplete,
             )
             if not batch:
                 break

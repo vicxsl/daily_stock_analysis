@@ -9,7 +9,7 @@ import os
 import sys
 import tempfile
 import unittest
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -42,6 +42,11 @@ def _reset_auth_globals() -> None:
     auth._password_hash_salt = None
     auth._password_hash_stored = None
     auth._rate_limit = {}
+
+
+def _quote_time() -> datetime:
+    """Give successful quote fixtures an explicit, current source time."""
+    return datetime.now(timezone(timedelta(hours=8)))
 
 
 class AlertApiTestCase(unittest.TestCase):
@@ -198,7 +203,10 @@ class AlertApiTestCase(unittest.TestCase):
                 self.assertEqual(stored_state(), before)
 
         # Background loading retains its live quote and snapshot persistence.
-        with patch.object(PortfolioService, "_fetch_realtime_position_price", return_value=(30.0, "test")) as quote:
+        with patch.object(PortfolioService, "_fetch_realtime_position_price", return_value={
+            "price": 30.0, "provider": "test", "kind": "realtime",
+            "provider_time": _quote_time().isoformat(), "fetched_at": _quote_time().isoformat(),
+        }) as quote:
             runtime = AlertWorker()._load_runtime_rules(config)
         self.assertEqual(sum(rule.source == "legacy_env" for rule in runtime), 0)
         self.assertEqual({call.args[0] for call in quote.call_args_list}, {"AAPL", "MSFT"})
@@ -647,7 +655,7 @@ class AlertApiTestCase(unittest.TestCase):
         })
 
         async def _quote(_monitor, stock_code):
-            return SimpleNamespace(price=11.0 if stock_code == "600519" else 9.0)
+            return SimpleNamespace(price=11.0 if stock_code == "600519" else 9.0, quote_time=_quote_time())
 
         with patch("src.agent.events.EventMonitor._get_realtime_quote", new=_quote):
             resp = self.client.post(f"/api/v1/alerts/rules/{rule['id']}/test")
@@ -671,7 +679,7 @@ class AlertApiTestCase(unittest.TestCase):
 
         async def _slow_quote(_monitor, _stock_code):
             await asyncio.sleep(0.05)
-            return SimpleNamespace(price=11.0)
+            return SimpleNamespace(price=11.0, quote_time=_quote_time())
 
         with patch("src.services.alert_service.DRY_RUN_TARGET_TIMEOUT_SECONDS", 0.001), patch(
             "src.agent.events.EventMonitor._get_realtime_quote",
@@ -861,7 +869,7 @@ class AlertApiTestCase(unittest.TestCase):
 
         with patch(
             "src.agent.events.EventMonitor._get_realtime_quote",
-            new=AsyncMock(return_value=SimpleNamespace(price=1800.0)),
+            new=AsyncMock(return_value=SimpleNamespace(price=1800.0, quote_time=_quote_time())),
         ) as quote:
             resp = self.client.post(f"/api/v1/alerts/rules/{rule['id']}/test")
 
@@ -880,7 +888,7 @@ class AlertApiTestCase(unittest.TestCase):
 
         with patch(
             "src.agent.events.EventMonitor._get_realtime_quote",
-            new=AsyncMock(return_value=SimpleNamespace(price=1700.0)),
+            new=AsyncMock(return_value=SimpleNamespace(price=1700.0, quote_time=_quote_time())),
         ):
             resp = self.client.post(f"/api/v1/alerts/rules/{rule['id']}/test")
 
@@ -917,7 +925,7 @@ class AlertApiTestCase(unittest.TestCase):
 
         with patch(
             "src.agent.events.EventMonitor._get_realtime_quote",
-            new=AsyncMock(return_value={"pct_chg": " -3.25% "}),
+            new=AsyncMock(return_value={"pct_chg": " -3.25% ", "quote_time": _quote_time()}),
         ):
             resp = self.client.post(f"/api/v1/alerts/rules/{rule['id']}/test")
 

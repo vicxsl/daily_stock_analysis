@@ -771,19 +771,77 @@ def _save_reused_market_review_report(
         logger.warning("复用大盘上下文保存大盘复盘报告失败: %s", exc)
 
 
-def _run_auto_backtest(config: Config) -> None:
-    """Run the independently configured auto-backtest without failing analysis."""
+def _auto_backtest_run_id() -> str:
+    """Stable run id for the current analysis round's post-evaluation stage."""
+
+    current = globals().get("_LAST_ANALYSIS_RUN_ID")
+    if not current:
+        current = uuid.uuid4().hex[:12]
+        globals()["_LAST_ANALYSIS_RUN_ID"] = current
+    return current
+
+
+def _begin_auto_backtest_round() -> None:
+    """Mark the start of one analysis round; evaluation stage not entered yet."""
+
+    from src.services.runtime_scheduler import build_auto_backtest_status, write_auto_backtest_status
+
+    started_at = datetime.now().isoformat()
+    payload = build_auto_backtest_status(
+        run_id=_auto_backtest_run_id(),
+        status="not_entered",
+        started_at=started_at,
+        finished_at=None,
+        stats=None,
+        error=None,
+    )
+    if not write_auto_backtest_status(payload):
+        logger.warning("自动回测阶段状态写入失败（not_entered），不伪造评估状态")
+
+
+def _run_auto_backtest(config: Config) -> Dict[str, Any]:
+    """Run the auto-backtest and record its own stage status separately.
+
+    The evaluation outcome is persisted in auto-backtest-status.json so a
+    failed or skipped evaluation can no longer be masked by a successful
+    analysis run. Returns the stage payload; callers may ignore it.
+    """
+
+    from src.services.runtime_scheduler import build_auto_backtest_status, write_auto_backtest_status
+
+    run_id = _auto_backtest_run_id()
+    started_at = datetime.now().isoformat()
+
+    if not getattr(config, 'backtest_enabled', False):
+        payload = build_auto_backtest_status(
+            run_id=run_id,
+            status="disabled",
+            started_at=started_at,
+            finished_at=datetime.now().isoformat(),
+            stats=None,
+            error=None,
+        )
+        write_auto_backtest_status(payload)
+        return payload
+
+    write_ok = write_auto_backtest_status(
+        build_auto_backtest_status(
+            run_id=run_id,
+            status="running",
+            started_at=started_at,
+        )
+    )
+    if not write_ok:
+        logger.warning("自动回测阶段状态写入失败（running），不伪造评估状态")
 
     try:
-        if not getattr(config, 'backtest_enabled', False):
-            return
-
         from src.services.backtest_service import BacktestService
 
         logger.info("开始自动回测...")
         service = BacktestService()
         stats = service.run_backtest(
             force=False,
+            retry_incomplete=True,
             eval_window_days=getattr(config, 'backtest_eval_window_days', 10),
             min_age_days=getattr(config, 'backtest_min_age_days', 14),
             limit=200,
@@ -793,8 +851,28 @@ def _run_auto_backtest(config: Config) -> None:
             f"saved={stats.get('saved')} completed={stats.get('completed')} "
             f"insufficient={stats.get('insufficient')} errors={stats.get('errors')}"
         )
+        payload = build_auto_backtest_status(
+            run_id=run_id,
+            status="completed",
+            started_at=started_at,
+            finished_at=datetime.now().isoformat(),
+            stats=stats,
+            error=None,
+        )
+        write_auto_backtest_status(payload)
+        return payload
     except Exception as exc:
         logger.warning(f"自动回测失败（已忽略）: {exc}")
+        payload = build_auto_backtest_status(
+            run_id=run_id,
+            status="failed",
+            started_at=started_at,
+            finished_at=datetime.now().isoformat(),
+            stats=None,
+            error=str(exc)[:500],
+        )
+        write_auto_backtest_status(payload)
+        return payload
 
 
 def run_full_analysis(
@@ -815,6 +893,9 @@ def run_full_analysis(
     （指数目标用于推导 market=cn 与能力矩阵）。
     ``refresh_watchlist=False`` 仅用于已原子认领的定时快照，避免认领后再次热更新。
     """
+    # Each analysis round resets the auto-backtest stage file so a stale
+    # completed status can never be misread as this round's evaluation result.
+    _begin_auto_backtest_round()
     # Portfolio resolution is its own CLI contract boundary. A broker import
     # failure must reach the one-shot caller, while all later work keeps the
     # existing run_full_analysis return-value semantics.

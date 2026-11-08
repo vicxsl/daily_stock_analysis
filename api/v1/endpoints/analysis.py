@@ -678,7 +678,22 @@ def trigger_market_review(
 
     lock_token = _try_acquire_market_review_lock(runtime_config)
     if lock_token is None:
-        raise api_error(409, "duplicate_market_review", "大盘复盘正在执行中，请稍后再试")
+        # R4/F10: carry the running task's id when the in-process task queue
+        # knows it, so clients can wait on / reuse the SAME task instead of
+        # blind re-POSTs; when the lock is held outside this process (CLI /
+        # scheduler), existing_task_id stays null and the client must poll
+        # /analysis/tasks — never guess.
+        existing_task_id = None
+        try:
+            existing_task_id = get_task_queue().get_analyzing_task_id("market_review")
+        except Exception:  # pragma: no cover - defensive
+            existing_task_id = None
+        raise api_error(
+            409,
+            "duplicate_market_review",
+            "大盘复盘正在执行中，请稍后再试",
+            detail={"existing_task_id": existing_task_id},
+        )
 
     try:
         task_id = uuid.uuid4().hex

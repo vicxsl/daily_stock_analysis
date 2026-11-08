@@ -7,7 +7,7 @@ import json
 import os
 import tempfile
 import unittest
-from datetime import date
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -27,6 +27,11 @@ from src.services.alert_service import AlertService
 from src.services.alert_worker import AlertWorker
 from src.services.decision_signal_service import DecisionSignalService
 from src.storage import DatabaseManager
+
+
+def _quote_time() -> datetime:
+    """Give successful quote fixtures an explicit, current source time."""
+    return datetime.now(timezone(timedelta(hours=8)))
 
 
 class AlertIndicatorHelperTestCase(unittest.TestCase):
@@ -342,7 +347,7 @@ class AlertWorkerTestCase(unittest.TestCase):
 
         with patch(
             "src.agent.events.EventMonitor._get_realtime_quote",
-            new=AsyncMock(return_value=SimpleNamespace(price=1810.0)),
+            new=AsyncMock(side_effect=lambda *_args: SimpleNamespace(price=1810.0, quote_time=_quote_time())),
         ):
             stats = worker.run_once()
 
@@ -372,7 +377,7 @@ class AlertWorkerTestCase(unittest.TestCase):
 
         with patch(
             "src.agent.events.EventMonitor._get_realtime_quote",
-            new=AsyncMock(return_value=SimpleNamespace(price=1810.0)),
+            new=AsyncMock(side_effect=lambda *_args: SimpleNamespace(price=1810.0, quote_time=_quote_time())),
         ):
             stats = worker.run_once()
 
@@ -407,7 +412,7 @@ class AlertWorkerTestCase(unittest.TestCase):
 
         with patch(
             "src.agent.events.EventMonitor._get_realtime_quote",
-            new=AsyncMock(return_value=SimpleNamespace(price=1810.0)),
+            new=AsyncMock(side_effect=lambda *_args: SimpleNamespace(price=1810.0, quote_time=_quote_time())),
         ):
             worker.run_once()
             worker.run_once()
@@ -478,7 +483,7 @@ class AlertWorkerTestCase(unittest.TestCase):
 
         with patch(
             "src.agent.events.EventMonitor._get_realtime_quote",
-            new=AsyncMock(return_value=SimpleNamespace(price=1810.0)),
+            new=AsyncMock(side_effect=lambda *_args: SimpleNamespace(price=1810.0, quote_time=_quote_time())),
         ):
             stats = worker.run_once()
 
@@ -541,7 +546,7 @@ class AlertWorkerTestCase(unittest.TestCase):
 
         async def _quote(_monitor, stock_code):
             seen_codes.append(stock_code)
-            return SimpleNamespace(price=1810.0)
+            return SimpleNamespace(price=1810.0, quote_time=_quote_time())
 
         worker = AlertWorker(config_provider=lambda: self._config(), service=self.service, notifier=notifier)
         with patch("src.agent.events.EventMonitor._get_realtime_quote", new=_quote):
@@ -606,8 +611,8 @@ class AlertWorkerTestCase(unittest.TestCase):
 
         async def _quote(_monitor, stock_code):
             if stock_code == "300750":
-                return {"pct_chg": "-3.75%"}
-            return SimpleNamespace(price=1810.0)
+                return {"pct_chg": "-3.75%", "quote_time": _quote_time()}
+            return SimpleNamespace(price=1810.0, quote_time=_quote_time())
 
         worker = AlertWorker(
             config_provider=lambda: self._config(legacy_rules),
@@ -629,7 +634,7 @@ class AlertWorkerTestCase(unittest.TestCase):
         notifier = self._notifier()
 
         async def _quote(_monitor, _stock_code):
-            return SimpleNamespace(price=1810.0)
+            return SimpleNamespace(price=1810.0, quote_time=_quote_time())
 
         worker = AlertWorker(
             config_provider=lambda: self._config(legacy_rules),
@@ -647,7 +652,7 @@ class AlertWorkerTestCase(unittest.TestCase):
         triggers = self._triggers(status="triggered")
         self.assertEqual(len(triggers), 2)
         self.assertTrue(all(item["rule_id"] is None for item in triggers))
-        self.assertTrue(all(item["data_timestamp"] is None for item in triggers))
+        self.assertTrue(all(item["data_timestamp"] is not None for item in triggers))
         notifier.send_with_results.assert_called_once()
 
     def test_legacy_json_parse_failure_does_not_crash_or_block_persisted_rules(self) -> None:
@@ -658,7 +663,7 @@ class AlertWorkerTestCase(unittest.TestCase):
 
         with patch(
             "src.agent.events.EventMonitor._get_realtime_quote",
-            new=AsyncMock(return_value=SimpleNamespace(price=1810.0)),
+            new=AsyncMock(side_effect=lambda *_args: SimpleNamespace(price=1810.0, quote_time=_quote_time())),
         ):
             stats = worker.run_once()
 
@@ -704,53 +709,50 @@ class AlertWorkerTestCase(unittest.TestCase):
         self.assertIn("No realtime quote", triggers[0]["diagnostics"])
         notifier.send_with_results.assert_not_called()
 
-    def test_price_cross_numeric_yyyymmdd_quote_date_writes_correct_timestamp(self) -> None:
+    def test_price_cross_unknown_or_stale_time_is_degraded_without_notification(self) -> None:
         rule = self._create_rule(target="600519")
         notifier = self._notifier()
         worker = AlertWorker(config_provider=lambda: self._config(), service=self.service, notifier=notifier)
+        now = datetime(2026, 5, 18, 10, 30, tzinfo=timezone(timedelta(hours=8)))
+        cases = [
+            (SimpleNamespace(price=1810.0), None),
+            (SimpleNamespace(price=1810.0, timestamp=1700000000), None),
+            (SimpleNamespace(price=1810.0, date=20260517), "2026-05-17T00:00:00"),
+            (SimpleNamespace(price=1810.0, quote_time="2026-05-17 15:00:00"), "2026-05-17T15:00:00"),
+            (SimpleNamespace(price=1810.0, quote_time="2026-05-18 09:00:00"), "2026-05-18T09:00:00"),
+        ]
+        class FixedDateTime(datetime):
+            @classmethod
+            def now(cls, tz=None):
+                return now if tz else now.replace(tzinfo=None)
 
-        with patch(
-            "src.agent.events.EventMonitor._get_realtime_quote",
-            new=AsyncMock(return_value=SimpleNamespace(price=1810.0, date=20260517)),
-        ):
-            stats = worker.run_once()
+        for quote, expected_timestamp in cases:
+            with self.subTest(quote=quote), patch(
+                "src.services.alert_service.datetime", FixedDateTime,
+            ), patch(
+                "src.agent.events.EventMonitor._get_realtime_quote", new=AsyncMock(return_value=quote),
+            ):
+                stats = worker.run_once()
+                self.assertEqual(stats["triggered"], 0)
+                self.assertEqual(stats["degraded"], 1)
+                trigger = self._triggers(rule_id=rule["id"], status="degraded")[0]
+                self.assertEqual(trigger["data_timestamp"], expected_timestamp)
+                self.assertIn("source time unknown or stale", trigger["diagnostics"])
+        notifier.send_with_results.assert_not_called()
+        self.assertEqual(self._notifications(), [])
 
-        self.assertEqual(stats["triggered"], 1)
-        triggers = self._triggers(rule_id=rule["id"], status="triggered")
-        self.assertEqual(len(triggers), 1)
-        self.assertEqual(triggers[0]["data_timestamp"], "2026-05-17T00:00:00")
-
-    def test_price_cross_space_separated_quote_time_writes_timestamp(self) -> None:
+    def test_price_cross_current_space_separated_time_writes_timestamp(self) -> None:
         rule = self._create_rule(target="600519")
-        notifier = self._notifier()
-        worker = AlertWorker(config_provider=lambda: self._config(), service=self.service, notifier=notifier)
-
+        stamp = _quote_time().replace(tzinfo=None, microsecond=0).isoformat(sep=" ")
+        worker = AlertWorker(config_provider=lambda: self._config(), service=self.service, notifier=self._notifier())
         with patch(
             "src.agent.events.EventMonitor._get_realtime_quote",
-            new=AsyncMock(return_value=SimpleNamespace(price=1810.0, quote_time="2026-05-17 15:00:00")),
+            new=AsyncMock(return_value=SimpleNamespace(price=1810.0, quote_time=stamp)),
         ):
             stats = worker.run_once()
-
         self.assertEqual(stats["triggered"], 1)
-        triggers = self._triggers(rule_id=rule["id"], status="triggered")
-        self.assertEqual(len(triggers), 1)
-        self.assertEqual(triggers[0]["data_timestamp"], "2026-05-17T15:00:00")
-
-    def test_ambiguous_numeric_quote_timestamp_is_not_written_as_epoch(self) -> None:
-        rule = self._create_rule(target="600519")
-        notifier = self._notifier()
-        worker = AlertWorker(config_provider=lambda: self._config(), service=self.service, notifier=notifier)
-
-        with patch(
-            "src.agent.events.EventMonitor._get_realtime_quote",
-            new=AsyncMock(return_value=SimpleNamespace(price=1810.0, timestamp=1700000000)),
-        ):
-            stats = worker.run_once()
-
-        self.assertEqual(stats["triggered"], 1)
-        triggers = self._triggers(rule_id=rule["id"], status="triggered")
-        self.assertEqual(len(triggers), 1)
-        self.assertIsNone(triggers[0]["data_timestamp"])
+        trigger = self._triggers(rule_id=rule["id"], status="triggered")[0]
+        self.assertEqual(trigger["data_timestamp"], stamp.replace(" ", "T"))
 
     def test_service_test_rule_exception_uses_same_sanitized_reason_and_message(self) -> None:
         rule = self._create_rule(target="600519")
@@ -1294,7 +1296,7 @@ class AlertWorkerTestCase(unittest.TestCase):
         async def _quote(_monitor, stock_code):
             if stock_code == "600519":
                 raise RuntimeError("token=secret-token failed at https://example.com/webhook")
-            return {"pct_chg": "-3.25%"}
+            return {"pct_chg": "-3.25%", "quote_time": _quote_time()}
 
         worker = AlertWorker(config_provider=lambda: self._config(), service=self.service, notifier=notifier)
         with patch("src.agent.events.EventMonitor._get_realtime_quote", new=_quote):
@@ -1320,8 +1322,8 @@ class AlertWorkerTestCase(unittest.TestCase):
 
         async def _quote(_monitor, stock_code):
             if stock_code == "600519":
-                return SimpleNamespace(price=1810.0)
-            return {"pct_chg": "-3.25%"}
+                return SimpleNamespace(price=1810.0, quote_time=_quote_time())
+            return {"pct_chg": "-3.25%", "quote_time": _quote_time()}
 
         worker = AlertWorker(config_provider=lambda: self._config(), service=self.service, notifier=notifier)
         with patch("src.agent.events.EventMonitor._get_realtime_quote", new=_quote):
@@ -1351,7 +1353,7 @@ class AlertWorkerTestCase(unittest.TestCase):
         worker = AlertWorker(config_provider=lambda: self._config(), service=self.service, notifier=FakeNotifier())
         with patch(
             "src.agent.events.EventMonitor._get_realtime_quote",
-            new=AsyncMock(return_value=SimpleNamespace(price=1810.0)),
+            new=AsyncMock(side_effect=lambda *_args: SimpleNamespace(price=1810.0, quote_time=_quote_time())),
         ):
             stats = worker.run_once()
 
@@ -1385,7 +1387,7 @@ class AlertWorkerTestCase(unittest.TestCase):
         worker = AlertWorker(config_provider=lambda: self._config(), service=self.service, notifier=FakeNotifier())
         with patch(
             "src.agent.events.EventMonitor._get_realtime_quote",
-            new=AsyncMock(return_value=SimpleNamespace(price=1810.0)),
+            new=AsyncMock(side_effect=lambda *_args: SimpleNamespace(price=1810.0, quote_time=_quote_time())),
         ):
             stats = worker.run_once()
 
@@ -1422,7 +1424,7 @@ class AlertWorkerTestCase(unittest.TestCase):
         worker = AlertWorker(config_provider=lambda: self._config(), service=self.service, notifier=FakeNotifier())
         with patch(
             "src.agent.events.EventMonitor._get_realtime_quote",
-            new=AsyncMock(return_value=SimpleNamespace(price=1810.0)),
+            new=AsyncMock(side_effect=lambda *_args: SimpleNamespace(price=1810.0, quote_time=_quote_time())),
         ):
             first = worker.run_once()
             second = worker.run_once()
@@ -1447,7 +1449,7 @@ class AlertWorkerTestCase(unittest.TestCase):
             parameters={"direction": "down", "change_pct": 3.0},
         )
         notifier = self._notifier()
-        original_create_trigger = self.service.repo.create_trigger
+        original_create_trigger = self.service.repo.create_trigger_if_absent
 
         def _create_trigger(fields):
             if fields["target"] == "600519":
@@ -1456,11 +1458,11 @@ class AlertWorkerTestCase(unittest.TestCase):
 
         async def _quote(_monitor, stock_code):
             if stock_code == "600519":
-                return SimpleNamespace(price=1810.0)
-            return {"pct_chg": "-3.25%"}
+                return SimpleNamespace(price=1810.0, quote_time=_quote_time())
+            return {"pct_chg": "-3.25%", "quote_time": _quote_time()}
 
         worker = AlertWorker(config_provider=lambda: self._config(), service=self.service, notifier=notifier)
-        with patch.object(self.service.repo, "create_trigger", side_effect=_create_trigger), \
+        with patch.object(self.service.repo, "create_trigger_if_absent", side_effect=_create_trigger), \
              patch("src.agent.events.EventMonitor._get_realtime_quote", new=_quote):
             stats = worker.run_once()
 
@@ -1485,7 +1487,7 @@ class AlertWorkerTestCase(unittest.TestCase):
         )
         with patch(
             "src.agent.events.EventMonitor._get_realtime_quote",
-            new=AsyncMock(return_value=SimpleNamespace(price=1810.0)),
+            new=AsyncMock(side_effect=lambda *_args: SimpleNamespace(price=1810.0, quote_time=_quote_time())),
         ):
             worker.run_once()
             now["value"] += 30
@@ -1517,7 +1519,7 @@ class AlertWorkerTestCase(unittest.TestCase):
             side_effect=RuntimeError("database locked token=secret-token"),
         ), patch(
             "src.agent.events.EventMonitor._get_realtime_quote",
-            new=AsyncMock(return_value=SimpleNamespace(price=1810.0)),
+            new=AsyncMock(side_effect=lambda *_args: SimpleNamespace(price=1810.0, quote_time=_quote_time())),
         ):
             first = worker.run_once()
             now["value"] += 10
@@ -1553,7 +1555,7 @@ class AlertWorkerTestCase(unittest.TestCase):
             side_effect=RuntimeError("database locked"),
         ), patch(
             "src.agent.events.EventMonitor._get_realtime_quote",
-            new=AsyncMock(return_value=SimpleNamespace(price=1810.0)),
+            new=AsyncMock(side_effect=lambda *_args: SimpleNamespace(price=1810.0, quote_time=_quote_time())),
         ):
             first = worker.run_once()
             now["value"] += 10
@@ -1581,7 +1583,7 @@ class AlertWorkerTestCase(unittest.TestCase):
         )
         with patch(
             "src.agent.events.EventMonitor._get_realtime_quote",
-            new=AsyncMock(return_value=SimpleNamespace(price=1810.0)),
+            new=AsyncMock(side_effect=lambda *_args: SimpleNamespace(price=1810.0, quote_time=_quote_time())),
         ):
             worker.run_once()
             now["value"] += 10
@@ -1605,7 +1607,7 @@ class AlertWorkerTestCase(unittest.TestCase):
         )
         with patch(
             "src.agent.events.EventMonitor._get_realtime_quote",
-            new=AsyncMock(return_value=SimpleNamespace(price=1810.0)),
+            new=AsyncMock(side_effect=lambda *_args: SimpleNamespace(price=1810.0, quote_time=_quote_time())),
         ):
             worker.run_once()
             now["value"] += 10
@@ -1634,7 +1636,7 @@ class AlertWorkerTestCase(unittest.TestCase):
         )
         with patch(
             "src.agent.events.EventMonitor._get_realtime_quote",
-            new=AsyncMock(return_value=SimpleNamespace(price=1810.0)),
+            new=AsyncMock(side_effect=lambda *_args: SimpleNamespace(price=1810.0, quote_time=_quote_time())),
         ):
             first = worker.run_once()
             now["value"] += 10
@@ -1666,7 +1668,7 @@ class AlertWorkerTestCase(unittest.TestCase):
         now = {"value": 1000.0}
 
         async def _quote(_monitor, _stock_code):
-            return SimpleNamespace(price=11.0)
+            return SimpleNamespace(price=11.0, quote_time=_quote_time())
 
         worker = AlertWorker(
             config_provider=lambda: config,

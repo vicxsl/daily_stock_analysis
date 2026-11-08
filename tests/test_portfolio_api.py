@@ -477,7 +477,7 @@ class PortfolioApiTestCase(unittest.TestCase):
 
         with patch(
             "src.services.portfolio_service.PortfolioService._fetch_realtime_position_price",
-            return_value=(None, None),
+            return_value=None,
         ), patch("api.v1.endpoints.portfolio.get_task_queue", return_value=queue):
             resp = self.client.post(
                 "/api/v1/portfolio/positions/600519/analysis",
@@ -513,7 +513,7 @@ class PortfolioApiTestCase(unittest.TestCase):
 
         with patch(
             "src.services.portfolio_service.PortfolioService._fetch_realtime_position_price",
-            return_value=(None, None),
+            return_value=None,
         ), patch("api.v1.endpoints.portfolio.get_task_queue", return_value=queue):
             resp = self.client.post(
                 "/api/v1/portfolio/positions/600519.SH/analysis",
@@ -543,7 +543,7 @@ class PortfolioApiTestCase(unittest.TestCase):
 
         with patch(
             "src.services.portfolio_service.PortfolioService._fetch_realtime_position_price",
-            return_value=(None, None),
+            return_value=None,
         ), patch("api.v1.endpoints.portfolio.get_task_queue", return_value=queue):
             resp = self.client.post(
                 "/api/v1/portfolio/positions/1810.HK/analysis",
@@ -580,7 +580,7 @@ class PortfolioApiTestCase(unittest.TestCase):
 
         with patch(
             "src.services.portfolio_service.PortfolioService._fetch_realtime_position_price",
-            return_value=(None, None),
+            return_value=None,
         ), patch("api.v1.endpoints.portfolio.get_task_queue", return_value=queue):
             resp = self.client.post(
                 "/api/v1/portfolio/positions/600519/analysis",
