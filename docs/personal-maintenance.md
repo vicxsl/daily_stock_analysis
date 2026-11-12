@@ -4,7 +4,13 @@
 
 2026-11-08 核对 NAS 19 个运行源码文件与本分支内容一致（按 LF 换行规范化）；生产镜像与运行配置、数据仍以 NAS 为准。生产 compose 的 `init: true` 和重建保护不在此源码补丁中。该分支本身不代表已部署或已验证上游更新。
 
-`main` 保留上游原版，个人变更在此分支维护。需要升级时，先获取并检查上游变化，在独立分支合并或迁移个人改动并运行测试，再按生产环境的备份、数据迁移和受保护重建流程部署。不得把生产 `.env`、凭据、数据库、账户记录或其他私有配置加入仓库。
+`main` 跟随上游代码并保存个人自动化工作流，个人业务变更在此分支维护。不得把生产 `.env`、凭据、数据库、账户记录或其他私有配置加入仓库。
+
+个人分支的 push 会触发 `Personal NAS deployment`，经受限 SSH 请求 NAS 拉取分支最新提交、从 `docker/Dockerfile` 构建、运行断网个人契约测试，再执行备份和受保护部署。工作流支持手动重试，部署失败会返回失败状态。构建日志、测试结果、提交 SHA、镜像、备份和恢复结果保留在 NAS 的 `dsa-update/state/runs/`。同一提交已经成功上线时验证现有镜像并跳过重建。
+
+`Personal upstream sync PR` 每天 04:30（Asia/Taipei）检查上游 main，更新 `codex/upstream-sync` 并创建或更新面向个人分支的 PR，也支持手动执行。冲突在 PR 展示，由用户检查并合并。合并后触发上述部署流程，上游提交、PR 合并提交和部署 SHA 可用于追溯。专用同步分支由任务管理，勿在该分支保存个人改动。
+
+工作流连接参数使用仓库变量 `DSA_DEPLOY_BRANCH`、`DSA_DEPLOY_HOST`、`DSA_DEPLOY_USER`、`DSA_DEPLOY_HOST_KEY`、`DSA_UPSTREAM_REPOSITORY`，SSH 私钥使用 secret `DSA_DEPLOY_SSH_KEY`。两跳 SSH 均限定为部署请求并校验主机指纹。NAS 通过公开 HTTPS 拉取源码，无需仓库写权限。上游同步工作流申请 contents/pull-requests 写权限以维护同步分支和 PR。
 
 此前部署验证和恢复入口见本机投研运维仓库 `ai-investment/patches/dsa/v3.33.0/README.md`；生产重建使用既有 `dsa-redeploy.sh wrap`，不要直接重建触发额外研究。热点列表以最多两个板块并发取成分股，局部数据源异常向页面提示；生产实测和完整链路验收以实际部署结果为准。
 

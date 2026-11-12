@@ -1,0 +1,46 @@
+name: Personal NAS deployment
+
+on:
+  push:
+    branches: [codex/investment-reliability]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: personal-nas-deployment
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    if: github.repository_owner == 'vicxsl'
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - name: Request protected NAS deployment
+        env:
+          GH_TOKEN: ${{ github.token }}
+          DEPLOY_BRANCH: ${{ vars.DSA_DEPLOY_BRANCH }}
+          DEPLOY_HOST: ${{ vars.DSA_DEPLOY_HOST }}
+          DEPLOY_USER: ${{ vars.DSA_DEPLOY_USER }}
+          DEPLOY_HOST_KEY: ${{ vars.DSA_DEPLOY_HOST_KEY }}
+          DEPLOY_KEY: ${{ secrets.DSA_DEPLOY_SSH_KEY }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          commit=$(gh api "repos/$GITHUB_REPOSITORY/commits/$DEPLOY_BRANCH" --jq .sha)
+          [[ "$commit" =~ ^[0-9a-f]{40}$ ]]
+          : "${DEPLOY_HOST:?}" "${DEPLOY_USER:?}" "${DEPLOY_HOST_KEY:?}" "${DEPLOY_KEY:?}"
+          key_dir=$(mktemp -d)
+          trap 'rm -rf "$key_dir"' EXIT
+          chmod 700 "$key_dir"
+          printf '%s\n' "$DEPLOY_KEY" > "$key_dir/key"
+          printf '%s\n' "$DEPLOY_HOST_KEY" > "$key_dir/known_hosts"
+          chmod 600 "$key_dir/key" "$key_dir/known_hosts"
+          echo "Deploying $DEPLOY_BRANCH at $commit"
+          ssh -T -i "$key_dir/key" \
+            -o BatchMode=yes -o IdentitiesOnly=yes \
+            -o StrictHostKeyChecking=yes -o "UserKnownHostsFile=$key_dir/known_hosts" \
+            -o ConnectTimeout=30 -o ServerAliveInterval=30 -o ServerAliveCountMax=10 \
+            "$DEPLOY_USER@$DEPLOY_HOST" "deploy $commit"
