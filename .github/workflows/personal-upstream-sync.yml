@@ -1,0 +1,67 @@
+name: Personal upstream sync PR
+
+on:
+  schedule:
+    - cron: '30 20 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: personal-upstream-sync
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    if: github.repository_owner == 'vicxsl'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+      - name: Update upstream pull request
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PERSONAL_BRANCH: ${{ vars.DSA_DEPLOY_BRANCH }}
+          UPSTREAM_REPOSITORY: ${{ vars.DSA_UPSTREAM_REPOSITORY }}
+          SYNC_BRANCH: codex/upstream-sync
+        shell: bash
+        run: |
+          set -euo pipefail
+          : "${PERSONAL_BRANCH:?}" "${UPSTREAM_REPOSITORY:?}"
+          git remote add upstream "https://github.com/$UPSTREAM_REPOSITORY.git"
+          git fetch --no-tags upstream main
+          git fetch --no-tags origin "$PERSONAL_BRANCH"
+          upstream=$(git rev-parse refs/remotes/upstream/main)
+          personal=$(git rev-parse "refs/remotes/origin/$PERSONAL_BRANCH")
+          if git merge-base --is-ancestor "$upstream" "$personal"; then
+            echo "Personal branch already contains upstream $upstream"
+            exit 0
+          fi
+          previous=$(git ls-remote origin "refs/heads/$SYNC_BRANCH" | cut -f1)
+          git push "--force-with-lease=refs/heads/$SYNC_BRANCH:$previous" \
+            origin "$upstream:refs/heads/$SYNC_BRANCH"
+          count=$(git rev-list --count "$personal..$upstream")
+          body_file=$(mktemp)
+          trap 'rm -f "$body_file"' EXIT
+          cat > "$body_file" <<EOF
+          同步上游 [$UPSTREAM_REPOSITORY](https://github.com/$UPSTREAM_REPOSITORY) 的 main。
+
+          上游提交为 \`$upstream\`，个人分支当前为 \`$personal\`，待纳入 $count 个上游提交。
+
+          此分支随每日检查更新。请检查 PR 的冲突和验证结果，合并到 \`$PERSONAL_BRANCH\` 后会主动触发 NAS 构建、断网契约测试、备份和受保护部署。部署结果见 Personal NAS deployment 工作流及 NAS 的 dsa-update.service 日志。
+
+          PR 合并提交及 NAS 部署记录用于追溯最终上线版本。
+          EOF
+          title="chore: sync upstream main (${upstream:0:8})"
+          pr=$(gh pr list --repo "$GITHUB_REPOSITORY" --base "$PERSONAL_BRANCH" \
+            --head "$SYNC_BRANCH" --state open --json number --jq '.[0].number // empty')
+          if [ -n "$pr" ]; then
+            gh pr edit "$pr" --repo "$GITHUB_REPOSITORY" --title "$title" --body-file "$body_file"
+          else
+            gh pr create --repo "$GITHUB_REPOSITORY" --base "$PERSONAL_BRANCH" \
+              --head "$SYNC_BRANCH" --title "$title" --body-file "$body_file"
+          fi
