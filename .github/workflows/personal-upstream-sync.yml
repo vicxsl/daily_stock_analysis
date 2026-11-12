@@ -22,16 +22,25 @@ jobs:
       - uses: actions/checkout@v5
         with:
           fetch-depth: 0
+          persist-credentials: false
       - name: Update upstream pull request
         env:
           GH_TOKEN: ${{ github.token }}
           PERSONAL_BRANCH: ${{ vars.DSA_DEPLOY_BRANCH }}
           UPSTREAM_REPOSITORY: ${{ vars.DSA_UPSTREAM_REPOSITORY }}
           SYNC_BRANCH: codex/upstream-sync
+          SYNC_KEY: ${{ secrets.DSA_UPSTREAM_SYNC_SSH_KEY }}
         shell: bash
         run: |
           set -euo pipefail
           : "${PERSONAL_BRANCH:?}" "${UPSTREAM_REPOSITORY:?}"
+          : "${SYNC_KEY:?}"
+          key_dir=$(mktemp -d)
+          trap 'rm -rf "$key_dir"' EXIT
+          printf '%s\n' "$SYNC_KEY" > "$key_dir/key"
+          gh api meta --jq '.ssh_keys[] | "github.com " + .' > "$key_dir/known_hosts"
+          chmod 600 "$key_dir/key" "$key_dir/known_hosts"
+          export GIT_SSH_COMMAND="ssh -i $key_dir/key -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile=$key_dir/known_hosts"
           git remote add upstream "https://github.com/$UPSTREAM_REPOSITORY.git"
           git fetch --no-tags upstream main
           git fetch --no-tags origin "$PERSONAL_BRANCH"
@@ -43,10 +52,9 @@ jobs:
           fi
           previous=$(git ls-remote origin "refs/heads/$SYNC_BRANCH" | cut -f1)
           git push "--force-with-lease=refs/heads/$SYNC_BRANCH:$previous" \
-            origin "$upstream:refs/heads/$SYNC_BRANCH"
+            "git@github.com:$GITHUB_REPOSITORY.git" "$upstream:refs/heads/$SYNC_BRANCH"
           count=$(git rev-list --count "$personal..$upstream")
-          body_file=$(mktemp)
-          trap 'rm -f "$body_file"' EXIT
+          body_file="$key_dir/pr-body.md"
           cat > "$body_file" <<EOF
           同步上游 [$UPSTREAM_REPOSITORY](https://github.com/$UPSTREAM_REPOSITORY) 的 main。
 
